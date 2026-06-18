@@ -59,20 +59,23 @@ A Chrome extension for capturing and downloading web video streams you have legi
 
 ## Installation
 
-### From Source (Developer Mode)
+### Quick Install (Download ZIP)
 
-1. **Clone the repository**
-   ```bash
-   git clone https://github.com/ToxicOrca/toxic-downloader.git
-   ```
+1. Go to the [latest release](https://github.com/ToxicOrca/toxic-downloader/releases/latest)
+2. Download `toxic-downloader.zip`
+3. **Extract the ZIP** to a folder on your computer
+4. Open Chrome and navigate to `chrome://extensions`
+5. Enable **Developer mode** — toggle in the top-right corner
+6. Click **Load unpacked** and select the extracted folder
+7. **Pin the extension** — click the puzzle piece icon in the toolbar and pin Toxic Downloader
 
-2. **Open Chrome** and navigate to `chrome://extensions`
+### From Source
 
-3. **Enable Developer mode** — toggle in the top-right corner
+```bash
+git clone https://github.com/ToxicOrca/toxic-downloader.git
+```
 
-4. **Click "Load unpacked"** and select the `toxic-downloader` folder
-
-5. **Pin the extension** — click the puzzle piece icon in the toolbar and pin Toxic Downloader
+Then follow steps 4–7 above.
 
 > No build step required. The extension runs directly from source.
 
