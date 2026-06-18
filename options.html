@@ -1,0 +1,131 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Toxic Downloader - Settings</title>
+  <link rel="stylesheet" href="options.css">
+</head>
+<body>
+  <div class="container">
+    <header>
+      <svg width="28" height="28" viewBox="0 0 24 24" fill="none">
+        <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-1 14.5v-9l7 4.5-7 4.5z" fill="url(#grad)"/>
+        <defs><linearGradient id="grad" x1="0" y1="0" x2="24" y2="24"><stop stop-color="#a855f7"/><stop offset="1" stop-color="#06b6d4"/></linearGradient></defs>
+      </svg>
+      <h1>Toxic Downloader Settings</h1>
+    </header>
+
+    <section>
+      <h2>Download</h2>
+
+      <div class="setting-row">
+        <div class="setting-info">
+          <label for="defaultQuality">Default Quality</label>
+          <p>Preferred quality when downloading streams. You can still pick per-download.</p>
+        </div>
+        <select id="defaultQuality">
+          <option value="best">Best Available</option>
+          <option value="2160">4K (2160p)</option>
+          <option value="1080">1080p</option>
+          <option value="720">720p</option>
+          <option value="480">480p</option>
+          <option value="360">360p</option>
+        </select>
+      </div>
+
+      <div class="setting-row">
+        <div class="setting-info">
+          <label for="maxConcurrent">Max Concurrent Downloads</label>
+          <p>How many streams to download at the same time.</p>
+        </div>
+        <input type="number" id="maxConcurrent" min="1" max="10" value="3">
+      </div>
+
+      <div class="setting-row">
+        <div class="setting-info">
+          <label for="bandwidthLimit">Bandwidth Limit</label>
+          <p>Cap download speed. 0 = unlimited.</p>
+        </div>
+        <div class="bw-input">
+          <input type="number" id="bandwidthLimit" min="0" max="1000" value="0">
+          <span class="bw-unit">MB/s</span>
+        </div>
+      </div>
+
+      <div class="setting-row">
+        <div class="setting-info">
+          <label for="outputFormat">Output Format</label>
+          <p>File format for stream downloads. MP4 is most compatible. TS skips remuxing.</p>
+        </div>
+        <select id="outputFormat">
+          <option value="mp4">MP4 (remuxed)</option>
+          <option value="ts">TS (raw, no remux)</option>
+        </select>
+      </div>
+    </section>
+
+    <section>
+      <h2>Naming</h2>
+
+      <div class="setting-row column">
+        <div class="setting-info">
+          <label for="filenameTemplate">Filename Template</label>
+          <p>Custom naming pattern. Leave blank for smart auto-naming.</p>
+        </div>
+        <input type="text" id="filenameTemplate" placeholder="{show}_S{season}E{episode}_{quality}">
+        <div class="template-vars">
+          Available: <code>{title}</code> <code>{show}</code> <code>{season}</code> <code>{episode}</code> <code>{episode_name}</code> <code>{quality}</code> <code>{type}</code>
+        </div>
+        <div class="template-preview" id="templatePreview"></div>
+      </div>
+    </section>
+
+    <section>
+      <h2>Behavior</h2>
+
+      <div class="setting-row">
+        <div class="setting-info">
+          <label>Auto-scan on page load</label>
+          <p>Automatically detect videos when you navigate to a new page.</p>
+        </div>
+        <label class="toggle">
+          <input type="checkbox" id="autoScan">
+          <span class="toggle-slider"></span>
+        </label>
+      </div>
+
+      <div class="setting-row">
+        <div class="setting-info">
+          <label>Download Notifications</label>
+          <p>Show a notification when a download completes or fails.</p>
+        </div>
+        <label class="toggle">
+          <input type="checkbox" id="notifications" checked>
+          <span class="toggle-slider"></span>
+        </label>
+      </div>
+
+      <div class="setting-row">
+        <div class="setting-info">
+          <label>Auto-download Subtitles</label>
+          <p>Automatically download detected subtitle tracks alongside videos.</p>
+        </div>
+        <label class="toggle">
+          <input type="checkbox" id="subtitleAutoDownload">
+          <span class="toggle-slider"></span>
+        </label>
+      </div>
+    </section>
+
+    <div class="actions">
+      <button id="resetBtn" class="btn-reset">Reset to Defaults</button>
+      <button id="saveBtn" class="btn-save">Save Settings</button>
+    </div>
+
+    <div id="toast" class="toast hidden"></div>
+  </div>
+
+  <script src="options.js"></script>
+</body>
+</html>

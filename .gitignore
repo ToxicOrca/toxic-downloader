@@ -1,0 +1,27 @@
+# Claude Code
+CLAUDE.md
+
+# OS files
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Editor files
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+
+# Node (if ever added)
+node_modules/
+package-lock.json
+
+# Build artifacts
+*.zip
+*.crx
+*.pem
+
+# Icon source files
+icons/generate_icons.html
+icons/icon_original.png
