@@ -25,3 +25,6 @@ package-lock.json
 # Icon source files
 icons/generate_icons.html
 icons/icon_original.png
+
+# Native host manifest (generated per-install with local paths)
+native-host/com.toxicdownloader.ffmpeg.json

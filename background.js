@@ -24,6 +24,10 @@ const DEFAULTS = {
   autoScan: false,
   notifications: true,
   subtitleAutoDownload: false,
+  convertVttToSrt: false,
+  embedSubtitles: false,
+  remuxEngine: "builtin",
+  ffmpegPath: "ffmpeg",
   bandwidthLimit: 0, // 0 = unlimited, otherwise bytes/sec
 };
 
@@ -54,6 +58,16 @@ function stopKeepAliveIfIdle() {
     chrome.alarms.clear("toxic-keepalive");
     keepAliveInterval = null;
   }
+}
+
+// --- Activity Log ---
+const activityLog = []; // {time, message}
+const MAX_LOG = 100;
+
+function log(msg) {
+  activityLog.push({ time: Date.now(), message: msg });
+  if (activityLog.length > MAX_LOG) activityLog.shift();
+  try { chrome.storage.local.set({ activityLog }); } catch (_) {}
 }
 
 chrome.alarms.onAlarm.addListener((alarm) => {
@@ -167,14 +181,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   }
 
   if (msg.action === "downloadSubtitle") {
-    // Sanitize filename to prevent path traversal or invalid chars
-    const safeFilename = (msg.filename || "subtitle.vtt")
-      .replace(/[<>:"/\\|?*]+/g, "")
-      .replace(/\.\./g, "")
-      .replace(/^\/+/, "")
-      .substring(0, 200);
-    chrome.downloads.download({ url: msg.url, filename: safeFilename, saveAs: true }, (id) => {
-      sendResponse({ success: !chrome.runtime.lastError, downloadId: id });
+    downloadSubtitleFile(msg.url, msg.filename, true).then(result => {
+      sendResponse(result);
     });
     return true;
   }
@@ -200,6 +208,25 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       } else {
         sendResponse({ ok: false });
       }
+    });
+    return true;
+  }
+
+  if (msg.action === "getLog") {
+    sendResponse({ log: activityLog });
+    return true;
+  }
+
+  if (msg.action === "clearLog") {
+    activityLog.length = 0;
+    chrome.storage.local.set({ activityLog: [] });
+    sendResponse({ ok: true });
+    return true;
+  }
+
+  if (msg.action === "getLastEmbedResult") {
+    chrome.storage.local.get("lastEmbedResult", (data) => {
+      sendResponse({ result: data.lastEmbedResult || "No embed attempted yet" });
     });
     return true;
   }
@@ -572,6 +599,19 @@ function applyFilenameTemplate(template, video) {
   return result.replace(/[<>:"/\\|?*]+/g, "").replace(/\s+/g, "_").replace(/_+/g, "_").replace(/^_|_$/g, "").substring(0, 200) || video.filename;
 }
 
+// --- Save separate subtitle from background ---
+function saveSeparateSubtitle_bg(videoFilename, subtitleData) {
+  const baseName = videoFilename.replace(/\.[^.]+$/, "");
+  const lang = (subtitleData.lang || "en").replace(/[^a-zA-Z]/g, "").substring(0, 3) || "en";
+  const subFilename = baseName + "." + lang + ".srt";
+  const blob = new Blob([subtitleData.text], { type: "application/x-subrip" });
+  const reader = new FileReader();
+  reader.onload = () => {
+    chrome.downloads.download({ url: reader.result, filename: subFilename, saveAs: false });
+  };
+  reader.readAsDataURL(blob);
+}
+
 // --- Auto-download Subtitles ---
 
 async function autoDownloadSubtitles(tabId, videoFilename) {
@@ -581,17 +621,126 @@ async function autoDownloadSubtitles(tabId, videoFilename) {
   const subs = subtitleStore[tabId];
   if (!subs || subs.length === 0) return;
 
-  // Strip extension from video filename for subtitle naming
   const baseName = videoFilename.replace(/\.[^.]+$/, "");
 
   for (const sub of subs) {
     const safeLang = (sub.lang || "unknown").replace(/[^a-zA-Z0-9]/g, "");
     const safeType = (sub.type || "vtt").replace(/[^a-zA-Z0-9]/g, "");
-    const subFilename = baseName + "_" + safeLang + "." + safeType;
+    // Jellyfin/Plex naming: VideoName.lang.srt
+    const subFilename = baseName + "." + safeLang + "." + safeType;
     try {
-      chrome.downloads.download({ url: sub.url, filename: subFilename, saveAs: false });
+      await downloadSubtitleFile(sub.url, subFilename, false);
     } catch (_) {}
   }
+}
+
+// --- Subtitle Download with optional VTT-to-SRT conversion ---
+
+async function downloadSubtitleFile(url, filename, saveAs) {
+  const safeFilename = (filename || "subtitle.vtt")
+    .replace(/[<>:"/\\|?*]+/g, "")
+    .replace(/\.\./g, "")
+    .replace(/^\/+/, "")
+    .substring(0, 200);
+
+  const settings = await getSettings();
+  const isVtt = safeFilename.endsWith(".vtt") || url.match(/\.vtt(\?|$)/i);
+
+  if (settings.convertVttToSrt && isVtt) {
+    try {
+      const resp = await fetch(url);
+      if (!resp.ok) throw new Error("HTTP " + resp.status);
+      const vttText = await resp.text();
+      const srtText = convertVttToSrt(vttText);
+      const srtFilename = safeFilename.replace(/\.vtt$/i, ".srt");
+
+      // Create blob URL for the converted content
+      const blob = new Blob([srtText], { type: "application/x-subrip" });
+      const reader = new FileReader();
+      const dataUrl = await new Promise((resolve, reject) => {
+        reader.onload = () => resolve(reader.result);
+        reader.onerror = reject;
+        reader.readAsDataURL(blob);
+      });
+
+      return new Promise((resolve) => {
+        chrome.downloads.download({ url: dataUrl, filename: srtFilename, saveAs }, (id) => {
+          resolve({ success: !chrome.runtime.lastError, downloadId: id });
+        });
+      });
+    } catch (_) {
+      // Conversion failed — fall back to downloading the VTT as-is
+    }
+  }
+
+  // Download as-is (no conversion)
+  return new Promise((resolve) => {
+    chrome.downloads.download({ url, filename: safeFilename, saveAs }, (id) => {
+      resolve({ success: !chrome.runtime.lastError, downloadId: id });
+    });
+  });
+}
+
+// --- VTT to SRT Converter ---
+
+function convertVttToSrt(vttText) {
+  const lines = vttText.split(/\r?\n/);
+  const srtBlocks = [];
+  let blockNum = 1;
+  let i = 0;
+
+  // Skip WEBVTT header and any metadata
+  while (i < lines.length && !lines[i].includes("-->")) i++;
+
+  while (i < lines.length) {
+    const line = lines[i].trim();
+
+    // Look for timestamp line: 00:00:00.000 --> 00:00:05.000
+    if (line.includes("-->")) {
+      // Convert VTT timestamps to SRT format (. -> , for milliseconds)
+      const timestamp = line
+        .replace(/\./g, ",")
+        // Strip position/alignment metadata after timestamps
+        .replace(/\s+(position|align|size|line|vertical):.*$/gi, "")
+        .trim();
+
+      // Ensure timestamps have hours (SRT requires HH:MM:SS,mmm)
+      const parts = timestamp.split("-->");
+      const fixTime = (t) => {
+        t = t.trim();
+        // If format is MM:SS,mmm, prepend 00:
+        if (t.match(/^\d{2}:\d{2},\d{3}$/)) t = "00:" + t;
+        return t;
+      };
+      const fixedTimestamp = fixTime(parts[0]) + " --> " + fixTime(parts[1]);
+
+      // Collect subtitle text lines
+      const textLines = [];
+      i++;
+      while (i < lines.length && lines[i].trim() !== "") {
+        let textLine = lines[i];
+        // Strip VTT-specific tags like <c>, <b>, <i>, <u>, <v>, <lang>
+        textLine = textLine
+          .replace(/<\/?[cbiu]>/gi, "")
+          .replace(/<\/?v[^>]*>/gi, "")
+          .replace(/<\/?lang[^>]*>/gi, "")
+          .replace(/<\/?ruby>/gi, "")
+          .replace(/<\/?rt>/gi, "")
+          .replace(/<\d{2}:\d{2}[:\d.,]*>/g, ""); // inline timestamps
+        textLines.push(textLine);
+        i++;
+      }
+
+      if (textLines.length > 0) {
+        srtBlocks.push(blockNum + "\n" + fixedTimestamp + "\n" + textLines.join("\n"));
+        blockNum++;
+      }
+    } else {
+      i++;
+    }
+  }
+
+  return srtBlocks.join("\n\n") + "\n";
 }
 
 // --- Unified Stream Download (HLS + DASH) ---
@@ -755,19 +904,159 @@ async function downloadStream(masterUrl, filename, dlId, cookies, referer, origi
 
     update("downloading", 99, "Saving " + formatBytes(downloadedBytes) + "...");
 
-    await new Promise((resolve, reject) => {
-      chrome.tabs.sendMessage(tabIdForSave, { action: "hlsSave", dlId, filename: filename + "." + outputFormat }, (resp) => {
-        chrome.runtime.lastError ? reject(new Error(chrome.runtime.lastError.message)) : resolve(resp);
+    // Fetch subtitle data if embed setting is on
+    let subtitleData = null;
+    if (settings.embedSubtitles && outputFormat === "mp4") {
+      const subs = subtitleStore[tabIdForSave];
+      if (!subs || subs.length === 0) {
+        log("[subs] No subtitles in store for tab " + tabIdForSave);
+        update("downloading", 99, "No subtitles detected on this tab to embed");
+      } else {
+        update("downloading", 99, "Fetching subtitle for embed (" + subs[0].url.substring(0, 60) + "...)");
+
+        // Method 1: Fetch via content script (has page cookies)
+        try {
+          const subResult = await new Promise((resolve) => {
+            chrome.tabs.sendMessage(tabIdForSave, {
+              action: "fetchSubtitle", url: subs[0].url,
+            }, (resp) => {
+              if (chrome.runtime.lastError) {
+                update("downloading", 99, "Content script fetch failed: " + chrome.runtime.lastError.message);
+                resolve(null);
+              } else if (!resp?.text) {
+                update("downloading", 99, "Content script returned empty subtitle");
+                resolve(null);
+              } else {
+                resolve(resp.text);
+              }
+            });
+          });
+          if (subResult) {
+            let subText = subResult;
+            if (subs[0].type === "vtt" || subText.trimStart().startsWith("WEBVTT")) {
+              subText = convertVttToSrt(subText);
+            }
+            subtitleData = { text: subText, lang: subs[0].lang || "und" };
+            update("downloading", 99, "Subtitle fetched (" + subText.length + " chars), embedding...");
+          }
+        } catch (e) {
+          update("downloading", 99, "Content script subtitle error: " + e.message);
+        }
+
+        // Method 2: Fallback - fetch from background with auth headers
+        if (!subtitleData) {
+          update("downloading", 99, "Trying background fetch for subtitle...");
+          try {
+            const subDomain = new URL(subs[0].url).hostname;
+            const tempId = "_sub_" + Date.now();
+            downloadProgress[tempId] = {};
+            const subCookies = await getAllCookiesForUrl(subs[0].url);
+            await setupHeaderRules(tempId, subDomain, subCookies, referer, origin);
+            const subResp = await fetch(subs[0].url);
+            await clearHeaderRules(tempId);
+            delete downloadProgress[tempId];
+            if (subResp.ok) {
+              let subText = await subResp.text();
+              if (subs[0].type === "vtt" || subText.trimStart().startsWith("WEBVTT")) {
+                subText = convertVttToSrt(subText);
+              }
+              subtitleData = { text: subText, lang: subs[0].lang || "und" };
+              update("downloading", 99, "Subtitle fetched via background (" + subText.length + " chars), embedding...");
+            } else {
+              update("downloading", 99, "Background subtitle fetch failed: HTTP " + subResp.status);
+            }
+          } catch (e) {
+            update("downloading", 99, "Background subtitle error: " + e.message);
+          }
+        }
+
+        if (!subtitleData) {
+          update("downloading", 99, "Could not fetch subtitle — saving without embed");
+        }
+      }
+    }
+
+    const remuxEngine = settings.remuxEngine || "builtin";
+    log("[remux] Engine: " + remuxEngine + " | Format: " + outputFormat + " | Size: " + formatBytes(downloadedBytes) + " | Subs: " + (subtitleData ? subtitleData.text.length + " chars" : "none"));
+
+    if (remuxEngine === "native") {
+      log("[native] Saving .ts file first...");
+      update("downloading", 99, "Saving as .ts for FFmpeg processing...");
+      await new Promise((resolve, reject) => {
+        chrome.tabs.sendMessage(tabIdForSave, {
+          action: "hlsSave", dlId, filename: filename + ".ts",
+          subtitleData: null,
+        }, (resp) => { chrome.runtime.lastError ? reject(new Error(chrome.runtime.lastError.message)) : resolve(resp); });
       });
-    });
+
+      update("downloading", 99, "Waiting for file save...");
+      await new Promise(r => setTimeout(r, 3000));
+
+      const downloads = await new Promise(r => chrome.downloads.search({ orderBy: ["-startTime"], limit: 10 }, r));
+      log("[native] Recent downloads: " + (downloads || []).map(d => d.filename?.split(/[/\\]/).pop() + " (" + d.state + ")").join(", "));
+      const tsDownload = downloads?.find(d => d.filename && d.state === "complete" && (d.filename.includes(filename) || d.filename.endsWith(".ts")));
+
+      if (tsDownload?.filename) {
+        log("[native] Found file: " + tsDownload.filename);
+        update("downloading", 99, "Remuxing with FFmpeg...");
+        try {
+          const nativeResult = await new Promise((resolve, reject) => {
+            try {
+              chrome.runtime.sendNativeMessage("com.toxicdownloader.ffmpeg", {
+                action: "remux",
+                inputPath: tsDownload.filename,
+                subtitleText: subtitleData?.text || "",
+                subtitleLang: subtitleData?.lang || "eng",
+                ffmpegPath: settings.ffmpegPath || "ffmpeg",
+              }, (resp) => {
+                if (chrome.runtime.lastError) {
+                  log("[native] sendNativeMessage error: " + chrome.runtime.lastError.message);
+                  resolve({ success: false, error: chrome.runtime.lastError.message });
+                } else {
+                  resolve(resp);
+                }
+              });
+            } catch (e) {
+              log("[native] sendNativeMessage exception: " + e.message);
+              resolve({ success: false, error: e.message });
+            }
+          });
+
+          log("[native] Result: " + JSON.stringify(nativeResult));
+          if (nativeResult?.success) {
+            update("done", 100, "Remuxed with FFmpeg! " + formatBytes(nativeResult.size || downloadedBytes));
+            sendNotification("Download Complete", filename + ".mp4 (remuxed with FFmpeg)");
+          } else {
+            update("done", 100, "FFmpeg failed: " + (nativeResult?.error || "unknown") + " — .ts file saved");
+            log("[native] FAILED: " + (nativeResult?.error || "no response"));
+            sendNotification("Download Saved", filename + ".ts (FFmpeg remux failed)");
+          }
+        } catch (e) {
+          log("[native] Exception: " + e.message);
+          update("done", 100, "Native host error: " + e.message + " — .ts file saved");
+        }
+      } else {
+        log("[native] Could not find downloaded .ts file");
+        update("done", 100, "Could not locate saved file for FFmpeg processing — .ts file saved");
+      }
+    } else {
+      // Built-in remux (default) — send to content script
+      log("[builtin] Sending to content script for save/remux. File: " + filename + "." + outputFormat);
+      await new Promise((resolve, reject) => {
+        chrome.tabs.sendMessage(tabIdForSave, {
+          action: "hlsSave", dlId, filename: filename + "." + outputFormat, subtitleData,
+        }, (resp) => { chrome.runtime.lastError ? reject(new Error(chrome.runtime.lastError.message)) : resolve(resp); });
+      });
+      log("[builtin] Content script save complete");
+
+      update("done", 100, "Complete! " + formatBytes(downloadedBytes));
+      sendNotification("Download Complete", filename + " (" + formatBytes(downloadedBytes) + ")");
+    }
 
     await clearHeaderRules(dlId);
-    update("done", 100, "Complete! " + formatBytes(downloadedBytes));
-    sendNotification("Download Complete", filename + " (" + formatBytes(downloadedBytes) + ")");
     addToHistory({ filename, size: downloadedBytes, date: Date.now(), type: streamType });
 
-    // Auto-download subtitles alongside the video if setting is enabled
-    autoDownloadSubtitles(tabIdForSave, filename);
+    if (!subtitleData) autoDownloadSubtitles(tabIdForSave, filename);
 
     cleanupDownload(dlId);
 
@@ -1057,9 +1346,12 @@ const tabUrls = {};
 // --- Auto-scan on page load ---
 chrome.tabs.onUpdated.addListener(async (tabId, changeInfo) => {
   if (changeInfo.status === "loading") {
-    delete videoStore[tabId];
-    delete subtitleStore[tabId];
-    chrome.action.setBadgeText({ text: "", tabId });
+    const tabHasActiveDownload = Object.values(hlsDownloadTabs).includes(tabId);
+    if (!tabHasActiveDownload) {
+      delete videoStore[tabId];
+      delete subtitleStore[tabId];
+      chrome.action.setBadgeText({ text: "", tabId });
+    }
   }
 
   // Detect SPA navigation (URL changed without full page reload)
@@ -1067,12 +1359,14 @@ chrome.tabs.onUpdated.addListener(async (tabId, changeInfo) => {
     const oldUrl = tabUrls[tabId];
     tabUrls[tabId] = changeInfo.url;
     if (oldUrl && oldUrl !== changeInfo.url) {
-      // URL changed (SPA navigation) - clear old videos and subtitles
-      delete videoStore[tabId];
-      delete subtitleStore[tabId];
-      chrome.action.setBadgeText({ text: "", tabId });
-      // Tell content script to clear its internal state too
-      try { chrome.tabs.sendMessage(tabId, { action: "clearState" }); } catch (_) {}
+      // Don't clear if this tab has an active download
+      const tabHasActiveDownload = Object.values(hlsDownloadTabs).includes(tabId);
+      if (!tabHasActiveDownload) {
+        delete videoStore[tabId];
+        delete subtitleStore[tabId];
+        chrome.action.setBadgeText({ text: "", tabId });
+        try { chrome.tabs.sendMessage(tabId, { action: "clearState" }); } catch (_) {}
+      }
     }
   }
   if (changeInfo.status === "complete") {

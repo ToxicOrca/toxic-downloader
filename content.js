@@ -629,6 +629,45 @@
     return bytes.buffer;
   }
 
+  // Save subtitle as a separate file with Jellyfin/Plex compatible naming
+  // Convention: VideoName.lang.srt (e.g., ShowName_S01E03.en.srt)
+  function saveSeparateSubtitle(videoFilename, srtText, lang) {
+    const baseName = videoFilename.replace(/\.[^.]+$/, ""); // strip extension
+    const safeLang = (lang || "en").replace(/[^a-zA-Z]/g, "").substring(0, 3) || "en";
+    const subFilename = baseName + "." + safeLang + ".srt";
+    const subBlob = new Blob([srtText], { type: "application/x-subrip" });
+    const subUrl = URL.createObjectURL(subBlob);
+    const a = document.createElement("a");
+    a.href = subUrl;
+    a.download = subFilename;
+    a.style.display = "none";
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    setTimeout(() => URL.revokeObjectURL(subUrl), 60000);
+  }
+
+  function triggerSave(blob, filename, remuxNote, dlId) {
+    const blobUrl = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = blobUrl;
+    a.download = filename;
+    a.style.display = "none";
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+
+    if (remuxNote) {
+      chrome.runtime.sendMessage({
+        action: "hlsProgress",
+        id: dlId,
+        progress: { status: "done", percent: 100, text: "Saved as .ts (MP4 remux failed — file plays in VLC/mpv)", downloadedBytes: blob.size },
+      });
+    }
+
+    setTimeout(() => URL.revokeObjectURL(blobUrl), 120000);
+  }
+
   // Listen for messages
   chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     if (msg.action === "clearState") {
@@ -647,6 +686,20 @@
         sendResponse({ started: true });
       });
       return true;
+    } else if (msg.action === "fetchSubtitle") {
+      // Fetch subtitle from page context (has cookies)
+      fetch(msg.url, { credentials: "include" })
+        .then(r => r.ok ? r.text() : null)
+        .then(text => sendResponse({ text }))
+        .catch(() => sendResponse({ text: null }));
+      return true;
+    } else if (msg.action === "hlsSaveRaw") {
+      // Save buffered data directly as-is (already processed by ffmpeg)
+      const bufs = hlsBuffers[msg.dlId] || [];
+      const blob = new Blob(bufs, { type: "video/mp4" });
+      triggerSave(blob, msg.filename, null, msg.dlId);
+      delete hlsBuffers[msg.dlId];
+      sendResponse({ ok: true });
     } else if (msg.action === "hlsClearBuffers") {
       delete hlsBuffers[msg.dlId];
       sendResponse({ ok: true });
@@ -666,76 +719,108 @@
 
       let remuxNote = "";
 
-      // Check if segments are already MP4 fragments (DASH .m4s or .mp4 segments)
-      // MP4 fragments start with a box size + 'ftyp', 'moof', 'styp', or 'sidx'
+      // Determine content type and total size
+      let totalSize = 0;
+      for (const b of bufs) totalSize += b.byteLength;
+
+      // Detect what the segments actually are
       const firstBytes = bufs.length > 0 ? new Uint8Array(bufs[0].slice(0, 8)) : null;
-      const isMP4Fragments = firstBytes && (
-        String.fromCharCode(firstBytes[4], firstBytes[5], firstBytes[6], firstBytes[7]) === "ftyp" ||
-        String.fromCharCode(firstBytes[4], firstBytes[5], firstBytes[6], firstBytes[7]) === "styp" ||
-        String.fromCharCode(firstBytes[4], firstBytes[5], firstBytes[6], firstBytes[7]) === "moof" ||
-        String.fromCharCode(firstBytes[4], firstBytes[5], firstBytes[6], firstBytes[7]) === "sidx" ||
-        String.fromCharCode(firstBytes[4], firstBytes[5], firstBytes[6], firstBytes[7]) === "moov"
-      );
+      const isTS = firstBytes && firstBytes[0] === 0x47; // TS sync byte
+      const firstBoxType = firstBytes ? String.fromCharCode(firstBytes[4], firstBytes[5], firstBytes[6], firstBytes[7]) : "";
+      const isMP4Fragments = firstBytes && (firstBoxType === "ftyp" || firstBoxType === "styp" || firstBoxType === "moof" || firstBoxType === "sidx" || firstBoxType === "moov");
+
+      const hasSubData = msg.subtitleData && msg.subtitleData.text && msg.subtitleData.text.length > 0;
+      const hasEmbedder = typeof ToxicSubtitleEmbed !== "undefined";
+      let isRealMP4 = false; // true if blob has a proper moov box
+
+      function reportEmbed(text) {
+        chrome.runtime.sendMessage({ action: "hlsProgress", id: msg.dlId, progress: { status: "done", percent: 100, text: text } });
+        try { chrome.storage.local.set({ lastEmbedResult: text }); } catch (_) {}
+      }
 
       if (wantsTS) {
-        // User explicitly chose TS
         blob = new Blob(bufs, { type: "video/mp2t" });
       } else if (isMP4Fragments) {
-        // DASH segments are already MP4 — just concatenate, no remux needed
+        // fMP4 segments — concatenate directly (already valid MP4)
         blob = new Blob(bufs, { type: "video/mp4" });
-      } else {
-        // HLS .ts segments — try to remux to MP4
-        let remuxed = false;
+        isRealMP4 = true;
+      } else if (isTS && typeof ToxicRemuxer !== "undefined" && totalSize < 300 * 1024 * 1024) {
+        // TS segments under 300MB — try remux to proper MP4
         try {
-          if (typeof ToxicRemuxer !== "undefined") {
-            let totalSize = 0;
-            for (const b of bufs) totalSize += b.byteLength;
-            const tsData = new Uint8Array(totalSize);
-            let offset = 0;
-            for (const b of bufs) {
-              tsData.set(new Uint8Array(b), offset);
-              offset += b.byteLength;
-            }
-            const mp4Data = ToxicRemuxer.remux(tsData.buffer);
-            if (mp4Data && mp4Data.length > 0) {
-              blob = new Blob([mp4Data], { type: "video/mp4" });
-              remuxed = true;
-            }
+          const tsData = new Uint8Array(totalSize);
+          let offset = 0;
+          for (const b of bufs) { tsData.set(new Uint8Array(b), offset); offset += b.byteLength; }
+          const mp4Data = ToxicRemuxer.remux(tsData.buffer);
+          if (mp4Data && mp4Data.length > 0) {
+            blob = new Blob([mp4Data], { type: "video/mp4" });
+            isRealMP4 = true;
           }
-        } catch (e) {}
+        } catch (_) {}
 
-        if (!remuxed) {
-          // Remux failed or unavailable — save as direct concat .mp4
-          // This works for fMP4 segments and most players handle concat TS as .mp4 too
-          blob = new Blob(bufs, { type: "video/mp4" });
-          remuxNote = "direct_concat";
+        if (!isRealMP4) {
+          // Remux failed — save as .ts (honest extension)
+          blob = new Blob(bufs, { type: "video/mp2t" });
+          filename = filename.replace(/\.mp4$/, ".ts");
+          remuxNote = "remux_failed";
+        }
+      } else if (isTS) {
+        // TS segments too large to remux — save as .ts
+        blob = new Blob(bufs, { type: "video/mp2t" });
+        filename = filename.replace(/\.mp4$/, ".ts");
+        remuxNote = "ts_too_large";
+      } else {
+        // Unknown format — save as-is
+        blob = new Blob(bufs, { type: "video/mp4" });
+      }
+
+      // --- Subtitle handling ---
+      if (hasSubData && isRealMP4 && hasEmbedder) {
+        // Try embedding into real MP4
+        const reader = new FileReader();
+        reader.onload = function () {
+          const originalSize = reader.result.byteLength;
+          let embedWorked = false;
+          let embedResult;
+          try {
+            const embedded = ToxicSubtitleEmbed.embed(reader.result, msg.subtitleData.text, msg.subtitleData.lang);
+            const diagInfo = ToxicSubtitleEmbed.getLastInfo();
+            if (embedded && embedded.length > originalSize) {
+              blob = new Blob([embedded], { type: "video/mp4" });
+              embedWorked = true;
+              embedResult = "Subtitles embedded! " + diagInfo;
+            } else {
+              embedResult = "Embed failed: " + diagInfo;
+            }
+          } catch (e) {
+            embedResult = "Embed error: " + e.message;
+          }
+          if (!embedWorked) {
+            saveSeparateSubtitle(filename, msg.subtitleData.text, msg.subtitleData.lang);
+            embedResult += " — saved as separate .srt file";
+          }
+          triggerSave(blob, filename, remuxNote, msg.dlId);
+          reportEmbed(embedResult);
+        };
+        reader.onerror = function () {
+          saveSeparateSubtitle(filename, msg.subtitleData.text, msg.subtitleData.lang);
+          triggerSave(blob, filename, remuxNote, msg.dlId);
+          reportEmbed("Read error — saved subtitle as separate .srt file");
+        };
+        reader.readAsArrayBuffer(blob);
+      } else if (hasSubData) {
+        // Can't embed (TS format or no moov) — save subtitle as separate file
+        saveSeparateSubtitle(filename, msg.subtitleData.text, msg.subtitleData.lang);
+        triggerSave(blob, filename, remuxNote, msg.dlId);
+        reportEmbed("Saved as " + (filename.endsWith(".ts") ? ".ts" : ".mp4") + " + separate .srt subtitle");
+      } else {
+        triggerSave(blob, filename, remuxNote, msg.dlId);
+        if (remuxNote) {
+          reportEmbed(remuxNote === "ts_too_large"
+            ? "File too large to remux (" + (totalSize / 1048576).toFixed(0) + "MB) — saved as .ts"
+            : "Remux failed — saved as .ts");
         }
       }
 
-      const blobUrl = URL.createObjectURL(blob);
-      const a = document.createElement("a");
-      a.href = blobUrl;
-      a.download = filename;
-      a.style.display = "none";
-      document.body.appendChild(a);
-      a.click();
-      document.body.removeChild(a);
-
-      // Notify user if remux failed and we fell back to .ts
-      if (remuxNote) {
-        chrome.runtime.sendMessage({
-          action: "hlsProgress",
-          id: msg.dlId,
-          progress: {
-            status: "done",
-            percent: 100,
-            text: "Saved as .ts (MP4 remux failed — file plays in VLC/mpv)",
-            downloadedBytes: blob.size,
-          },
-        });
-      }
-
-      setTimeout(() => URL.revokeObjectURL(blobUrl), 120000);
       delete hlsBuffers[msg.dlId];
       sendResponse({ ok: true });
     }

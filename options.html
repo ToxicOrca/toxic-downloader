@@ -63,6 +63,25 @@
           <option value="ts">TS (raw, no remux)</option>
         </select>
       </div>
+
+      <div class="setting-row">
+        <div class="setting-info">
+          <label for="remuxEngine">Remux Engine</label>
+          <p>How to convert TS streams to MP4. FFmpeg.wasm runs in-browser (downloads ~25MB on first use). System FFmpeg requires FFmpeg installed on your PC but handles any file size.</p>
+        </div>
+        <select id="remuxEngine">
+          <option value="builtin">Built-in (small files only)</option>
+          <option value="native">System FFmpeg (requires install)</option>
+        </select>
+      </div>
+
+      <div class="setting-row hidden" id="ffmpegPathRow">
+        <div class="setting-info">
+          <label for="ffmpegPath">FFmpeg Path</label>
+          <p>Path to your FFmpeg binary. Leave blank to use system PATH.</p>
+        </div>
+        <input type="text" id="ffmpegPath" placeholder="ffmpeg" style="max-width: 250px;">
+      </div>
     </section>
 
     <section>
@@ -113,6 +132,28 @@
         </div>
         <label class="toggle">
           <input type="checkbox" id="subtitleAutoDownload">
+          <span class="toggle-slider"></span>
+        </label>
+      </div>
+
+      <div class="setting-row">
+        <div class="setting-info">
+          <label>Convert VTT to SRT</label>
+          <p>Automatically convert WebVTT subtitles to SRT format for external subtitle files.</p>
+        </div>
+        <label class="toggle">
+          <input type="checkbox" id="convertVttToSrt">
+          <span class="toggle-slider"></span>
+        </label>
+      </div>
+
+      <div class="setting-row">
+        <div class="setting-info">
+          <label>Embed Subtitles in MP4</label>
+          <p>Burn detected subtitle tracks directly into the MP4 file. No separate subtitle files needed — works with Jellyfin, Plex, and all media players.</p>
+        </div>
+        <label class="toggle">
+          <input type="checkbox" id="embedSubtitles">
           <span class="toggle-slider"></span>
         </label>
       </div>

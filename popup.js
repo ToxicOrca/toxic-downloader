@@ -50,10 +50,15 @@ if (dockBtn) {
 if (isSidePanel) {
   chrome.tabs.onActivated.addListener(() => {
     loadExisting();
+    // Subtitles are often detected after page load, re-check after a delay
+    setTimeout(loadExisting, 3000);
+    setTimeout(loadExisting, 8000);
   });
   chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
     if (changeInfo.status === "complete") {
       loadExisting();
+      setTimeout(loadExisting, 3000);
+      setTimeout(loadExisting, 8000);
     }
   });
 }
@@ -107,8 +112,8 @@ function loadActiveDownloads() {
     if (!section) return;
 
     const downloads = resp?.downloads || [];
-    // Filter to only active/paused/queued (not done/error)
-    const active = downloads.filter(d => d.status === "downloading" || d.status === "paused" || d.status === "queued" || d.status === "starting");
+    // Show all downloads that have progress data (including recently completed)
+    const active = downloads.filter(d => d.status === "downloading" || d.status === "paused" || d.status === "queued" || d.status === "starting" || d.status === "done" || d.status === "error");
 
     if (active.length === 0) {
       section.classList.add("hidden");
@@ -559,6 +564,10 @@ function pollProgress(dlId, btn, videoUrl) {
       if (prog.status === "done") {
         clearInterval(interval);
         delete activePolls[videoUrl];
+        // Show the final status text as a toast so user can read it
+        if (prog.text && prog.text !== "done") {
+          showToast(prog.text);
+        }
         hideProgress(videoUrl);
         showDownloadSuccess(btn);
       } else if (prog.status === "error") {
@@ -727,10 +736,11 @@ function showHistory() {
     videoListEl.innerHTML = "";
 
     // Show back button and search
-    statusEl.innerHTML = `<span class="history-back" id="historyBack">Back</span> | ${history.length} downloads | <span class="history-clear" id="historyClear">Clear all</span>`;
+    statusEl.innerHTML = `<span class="history-back" id="historyBack">Back</span> | ${history.length} downloads | <span class="history-clear" id="historyClear">Clear all</span> | <span class="history-back" id="embedDebug">Activity Log</span>`;
     statusEl.className = "status found";
 
     document.getElementById("historyBack")?.addEventListener("click", () => loadExisting());
+    document.getElementById("embedDebug")?.addEventListener("click", showLog);
     document.getElementById("historyClear")?.addEventListener("click", () => {
       chrome.runtime.sendMessage({ action: "clearHistory" }, () => {
         videoListEl.innerHTML = "";
@@ -823,6 +833,38 @@ function exportUrls() {
   URL.revokeObjectURL(url);
 
   showToast("Exported " + currentVideos.length + " URLs");
+}
+
+// --- Activity Log Viewer ---
+function showLog() {
+  chrome.runtime.sendMessage({ action: "getLog" }, (resp) => {
+    const entries = resp?.log || [];
+    emptyStateEl.classList.add("hidden");
+    videoListEl.classList.remove("hidden");
+    videoListEl.innerHTML = "";
+
+    statusEl.innerHTML = `<span class="history-back" id="logBack">Back</span> | Activity Log (${entries.length}) | <span class="history-clear" id="logClear">Clear</span>`;
+    statusEl.className = "status found";
+
+    document.getElementById("logBack")?.addEventListener("click", () => loadExisting());
+    document.getElementById("logClear")?.addEventListener("click", () => {
+      chrome.runtime.sendMessage({ action: "clearLog" }, () => showLog());
+    });
+
+    if (entries.length === 0) {
+      videoListEl.innerHTML = '<div class="video-item"><div class="video-info"><div class="video-name" style="color:#71717a">No log entries yet. Download something first.</div></div></div>';
+      return;
+    }
+
+    // Show newest first
+    entries.slice().reverse().forEach(entry => {
+      const item = document.createElement("div");
+      item.className = "log-entry";
+      const time = new Date(entry.time).toLocaleTimeString();
+      item.innerHTML = `<span class="log-time">${escapeHtml(time)}</span> <span class="log-msg">${escapeHtml(entry.message)}</span>`;
+      videoListEl.appendChild(item);
+    });
+  });
 }
 
 function resetScanBtn() {

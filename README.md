@@ -19,32 +19,41 @@ A Chrome extension for capturing and downloading web video streams you have legi
 ### Video Detection
 - **Smart source detection** — Scans the DOM and intercepts XHR/fetch requests to find video streams automatically
 - **Mutation observer** — Watches for dynamically loaded video elements
-- **Thumbnail preview** — Shows video thumbnails from page metadata (og:image, poster)
-- **Trailer detection** — Identifies trailers, previews, and promos by URL patterns, DOM context, and duration analysis
+- **Thumbnail preview** — Shows video thumbnails from page metadata when available
+- **Trailer detection** — Identifies trailers, previews, and promos by URL patterns, DOM context, and duration
 
 ### Downloading
-- **HLS stream support** — Downloads m3u8 playlists, fetches all segments, and combines into a single file
-- **DASH stream support** — Parses MPD manifests, handles SegmentTemplate/SegmentList/BaseURL, downloads video + audio tracks
+- **HLS stream support** — Downloads m3u8 playlists, fetches all segments, and combines them
+- **DASH stream support** — Parses MPD manifests, downloads video + audio tracks
 - **Direct file download** — Standard mp4, webm, mkv, and other direct video files
-- **Quality selector** — Pick your preferred resolution (4K, 1080p, 720p, etc.) before downloading
-- **In-browser TS-to-MP4 remuxing** — Converts transport streams to MP4 with no re-encoding or external tools
-- **Output format selection** — Choose between MP4 (remuxed) or raw TS in settings
-- **Subtitle detection** — Finds and downloads VTT, SRT, and ASS subtitle tracks
+- **Quality selector** — Pick your preferred resolution before downloading (when the stream offers multiple qualities)
 - **Batch download** — Download all detected videos on a page with one click
+
+### Remuxing & Subtitles
+- **Built-in TS-to-MP4 remuxer** — Converts transport streams to MP4 in-browser for smaller files
+- **System FFmpeg integration** — For large files, uses your local FFmpeg install via native messaging to remux TS → MP4 with embedded subtitles, no file size limit
+- **Subtitle detection** — Finds VTT, SRT, and ASS subtitle tracks on the page
+- **VTT-to-SRT conversion** — Converts WebVTT to SRT for better compatibility with media servers
+- **Subtitle embedding** — Embeds subtitles directly into MP4 files (via System FFmpeg)
+- **Auto-download subtitles** — Optionally downloads detected subtitle tracks alongside videos
+- **Jellyfin/Plex naming** — Subtitle files use `VideoName.lang.srt` format for automatic detection
 
 ### Smart Naming
 - **Intelligent file naming** — Parses JSON-LD, Open Graph tags, headings, breadcrumbs, and URL patterns
-- **TV show format** — Automatically names shows as `ShowName_S01E03.mp4`
-- **Filename templates** — Customize naming with variables: `{show}`, `{season}`, `{episode}`, `{quality}`, `{title}`, `{type}`
+- **TV show format** — Automatically names shows as `ShowName_S01E03_Episode_Title.mp4`
+- **Site name stripping** — Dynamically detects and removes the streaming site's brand name from titles
+- **Filename templates** — Customize naming with variables: `{show}`, `{season}`, `{episode}`, `{episode_name}`, `{quality}`, `{title}`, `{type}`
 
 ### Download Management
 - **Progress tracking** — Real-time progress bar with segment count, file size (MB/GB), and download speed (MB/s)
 - **Pause / Resume / Cancel** — Full control over active stream downloads
-- **Parallel downloads** — Download multiple videos simultaneously without conflicts
+- **Parallel downloads** — Download multiple videos simultaneously
 - **Background downloads** — Downloads continue even when the popup is closed
-- **Download history** — Persistent log of completed downloads with name, size, date, and type
+- **Active Downloads panel** — Shows all ongoing downloads across all tabs at the top of the UI
+- **Download history** — Persistent log with search, individual deletion, and clear all
 - **Bandwidth throttle** — Cap download speed to avoid saturating your connection
 - **Desktop notifications** — Chrome notifications on download complete or failure
+- **Activity log** — Detailed diagnostic log for troubleshooting download and remux issues
 
 ### UI & Usability
 - **Dark mode UI** — Clean dark interface with purple/cyan neon accents
@@ -53,7 +62,7 @@ A Chrome extension for capturing and downloading web video streams you have legi
 - **Copy URL** — One-click copy any video URL for use with VLC, ffmpeg, or yt-dlp
 - **Export URL list** — Export all detected URLs to a text file
 - **Right-click context menu** — "Download with Toxic Downloader" on any video element
-- **Settings page** — Full options page for quality, naming, format, throttle, and behavior
+- **Settings page** — Full options for quality, naming, format, remux engine, throttle, and behavior
 
 ---
 
@@ -79,6 +88,34 @@ Then follow steps 4–7 above.
 
 > No build step required. The extension runs directly from source.
 
+### System FFmpeg Setup (Optional)
+
+For large file remuxing and subtitle embedding, install the native FFmpeg host:
+
+**Prerequisites:**
+- [Python 3](https://python.org) installed and in PATH
+- [FFmpeg](https://ffmpeg.org/download.html) installed and in PATH
+
+**Windows:**
+```
+cd native-host
+install_windows.bat
+```
+
+**Linux / Mac:**
+```
+cd native-host
+chmod +x install_linux_mac.sh
+./install_linux_mac.sh
+```
+
+The installer will:
+1. Ask for your extension ID (found at `chrome://extensions`)
+2. Create a native messaging manifest
+3. Register it with Chrome
+
+Then select **"System FFmpeg"** in Toxic Downloader settings under Remux Engine.
+
 ---
 
 ## Usage
@@ -102,8 +139,9 @@ Then follow steps 4–7 above.
 - Use **Copy URL** to grab the direct stream URL for external tools
 - Trailers are automatically dimmed and sorted to the bottom
 - **Pause** long downloads and resume them later
-- Check **History** to see past downloads
+- Check **History** → **Activity Log** for detailed diagnostic info if something goes wrong
 - **Export** URLs to a text file for use with yt-dlp or ffmpeg
+- With System FFmpeg enabled, downloads are automatically remuxed to MP4 with embedded subtitles
 
 ---
 
@@ -111,21 +149,19 @@ Then follow steps 4–7 above.
 
 ### Detection
 1. **DOM scanning** — Finds `<video>`, `<source>`, `<track>`, and `<embed>` elements
-2. **Network interception** — Hooks `fetch()` and `XMLHttpRequest` to catch video and subtitle URLs as the page's player requests them
+2. **Network interception** — Hooks `fetch()` and `XMLHttpRequest` to catch video and subtitle URLs
 3. **Mutation observer** — Watches for dynamically added video elements
-4. **Metadata parsing** — Reads JSON-LD, Open Graph tags, headings, breadcrumbs, and URL patterns for titles and season/episode info
+4. **Metadata parsing** — Reads JSON-LD, Open Graph tags, headings, breadcrumbs, and URL patterns
 
-### HLS Downloads
-1. Fetches the m3u8 master playlist and presents available quality variants
-2. Downloads all `.ts` segments in parallel batches (with pause/resume support)
-3. Handles AES-128 encrypted streams
-4. Remuxes TS to MP4 in-browser or saves as raw TS
+### Stream Downloads
+1. Fetches the m3u8/mpd playlist and presents available quality variants
+2. Downloads all segments in parallel batches (with pause/resume support)
+3. Handles AES-128 encrypted HLS streams
+4. Saves as MP4 (remuxed) or TS depending on settings
 
-### DASH Downloads
-1. Parses the MPD XML manifest
-2. Selects the best video and audio representations
-3. Downloads init segments and media segments
-4. Combines into a single output file
+### Remux Pipeline
+- **Built-in** — JavaScript TS demuxer + MP4 muxer for files under ~300MB
+- **System FFmpeg** — For any file size: saves .ts first, then calls FFmpeg via native messaging to remux to MP4 with `mov_text` subtitles and `faststart` flag
 
 ### Authentication
 Cookies (including HttpOnly) are read via `chrome.cookies` API and injected into CDN requests using `declarativeNetRequest` session rules — each download gets its own isolated rule set.
@@ -136,8 +172,9 @@ Cookies (including HttpOnly) are read via `chrome.cookies` API and injected into
 
 - **Manifest V3** Chrome Extension
 - **Vanilla JavaScript** — zero dependencies, no build step
-- **Chrome APIs** — Side Panel, Downloads, Cookies, DeclarativeNetRequest, Notifications, Context Menus, Storage
+- **Chrome APIs** — Side Panel, Downloads, Cookies, DeclarativeNetRequest, Notifications, Context Menus, Storage, Native Messaging, Alarms
 - **Custom TS-to-MP4 remuxer** — Demuxes MPEG-TS and muxes H.264/AAC into fragmented MP4
+- **Native FFmpeg host** — Python native messaging bridge for system FFmpeg integration
 
 ---
 
@@ -150,11 +187,17 @@ toxic-downloader/
 ├── content.js             # Content script — detection, parsing, coordination
 ├── interceptor.js         # Page-context — XHR/fetch interception
 ├── hls-downloader.js      # Page-context — cookie extraction
-├── remux.js               # TS-to-MP4 remuxer
+├── remux.js               # Built-in TS-to-MP4 remuxer
+├── subtitle-embed.js      # MP4 subtitle track embedder
 ├── popup.html/css/js      # Popup UI
 ├── sidepanel.html         # Side panel UI
 ├── options.html/css/js    # Settings page
-└── icons/                 # Extension icons
+├── icons/                 # Extension icons
+└── native-host/           # System FFmpeg integration
+    ├── toxic_ffmpeg_host.py    # Native messaging host
+    ├── toxic_ffmpeg_host.bat   # Windows launcher
+    ├── install_windows.bat     # Windows installer
+    └── install_linux_mac.sh    # Linux/Mac installer
 ```
 
 ---

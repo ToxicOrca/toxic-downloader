@@ -803,6 +803,24 @@ footer {
   text-decoration: underline;
 }
 
+/* Log viewer */
+.log-entry {
+  padding: 6px 10px;
+  font-family: 'Consolas', 'Monaco', monospace;
+  font-size: 11px;
+  border-bottom: 1px solid #1e1e22;
+  word-break: break-all;
+}
+
+.log-time {
+  color: #52525b;
+  margin-right: 8px;
+}
+
+.log-msg {
+  color: #a1a1aa;
+}
+
 /* Scrollbar */
 ::-webkit-scrollbar {
   width: 6px;

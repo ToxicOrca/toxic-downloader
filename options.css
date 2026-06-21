@@ -55,6 +55,10 @@ section h2 {
   margin-bottom: 8px;
 }
 
+.setting-row.hidden {
+  display: none;
+}
+
 .setting-row.column {
   flex-direction: column;
   align-items: stretch;
