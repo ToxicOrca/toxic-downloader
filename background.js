@@ -552,11 +552,9 @@ async function fetchQualities(masterUrl) {
       variants = parseDASHQualities(text);
       // Estimate from MPD duration
       try {
-        const parser = new DOMParser();
-        const doc = parser.parseFromString(text, "text/xml");
-        const dur = doc.querySelector("MPD")?.getAttribute("mediaPresentationDuration");
-        if (dur) {
-          const m = dur.match(/PT(?:(\d+)H)?(?:(\d+)M)?(?:([\d.]+)S)?/);
+        const durMatch = text.match(/mediaPresentationDuration="([^"]+)"/);
+        if (durMatch) {
+          const m = durMatch[1].match(/PT(?:(\d+)H)?(?:(\d+)M)?(?:([\d.]+)S)?/);
           if (m) {
             const totalSec = (parseInt(m[1] || "0") * 3600) + (parseInt(m[2] || "0") * 60) + parseFloat(m[3] || "0");
             for (const v of variants) {
@@ -1110,124 +1108,146 @@ function parseHLSVariants(text) {
 
 // --- DASH Resolution ---
 
-async function resolveDASHSegments(mpdText, mpdUrl, selectedQuality, update) {
-  const parser = new DOMParser();
-  const doc = parser.parseFromString(mpdText, "text/xml");
+// --- Regex-based MPD XML helpers (DOMParser not available in service workers) ---
 
-  // Find video AdaptationSet
-  const adaptationSets = doc.querySelectorAll("AdaptationSet");
-  let videoSet = null, audioSet = null;
+function xmlAttr(tag, name) {
+  const m = tag.match(new RegExp(name + '="([^"]*)"'));
+  return m ? m[1] : "";
+}
 
-  for (const as of adaptationSets) {
-    const mime = as.getAttribute("mimeType") || "";
-    const contentType = as.getAttribute("contentType") || "";
-    if (mime.includes("video") || contentType === "video") videoSet = as;
-    else if (mime.includes("audio") || contentType === "audio") audioSet = as;
-  }
-
-  // Fallback: check Representations
-  if (!videoSet && !audioSet) {
-    for (const as of adaptationSets) {
-      const reps = as.querySelectorAll("Representation");
-      for (const r of reps) {
-        const mime = r.getAttribute("mimeType") || "";
-        if (mime.includes("video")) { videoSet = as; break; }
-        if (mime.includes("audio")) { audioSet = as; break; }
+function xmlFindAll(text, tagName) {
+  const results = [];
+  const openRe = new RegExp("<" + tagName + "[\\s>]", "gi");
+  let match;
+  while ((match = openRe.exec(text)) !== null) {
+    const start = match.index;
+    // Find the closing tag or self-closing
+    const selfClose = text.indexOf("/>", start);
+    const openEnd = text.indexOf(">", start);
+    if (selfClose >= 0 && selfClose < openEnd + 1) {
+      results.push(text.substring(start, selfClose + 2));
+    } else {
+      // Find matching close tag (simple, not nested)
+      const closeTag = "</" + tagName + ">";
+      const closeIdx = text.indexOf(closeTag, openEnd);
+      if (closeIdx >= 0) {
+        results.push(text.substring(start, closeIdx + closeTag.length));
+      } else {
+        results.push(text.substring(start, openEnd + 1));
       }
     }
   }
+  return results;
+}
 
-  if (!videoSet) throw new Error("No video track found in DASH manifest");
+function xmlInnerContent(tag, childTag) {
+  const m = tag.match(new RegExp("<" + childTag + "[^>]*>([^<]*)</" + childTag + ">"));
+  return m ? m[1].trim() : "";
+}
+
+// --- DASH Resolution (regex-based, no DOMParser) ---
+
+async function resolveDASHSegments(mpdText, mpdUrl, selectedQuality, update) {
+  const adaptationSets = xmlFindAll(mpdText, "AdaptationSet");
+  let videoSetXml = null, audioSetXml = null;
+
+  for (const asXml of adaptationSets) {
+    const mime = xmlAttr(asXml, "mimeType");
+    const ct = xmlAttr(asXml, "contentType");
+    const reps = xmlFindAll(asXml, "Representation");
+    const repMime = reps.length > 0 ? xmlAttr(reps[0], "mimeType") : "";
+    if (mime.includes("video") || ct === "video" || repMime.includes("video")) {
+      if (!videoSetXml) videoSetXml = asXml;
+    } else if (mime.includes("audio") || ct === "audio" || repMime.includes("audio")) {
+      if (!audioSetXml) audioSetXml = asXml;
+    }
+  }
+
+  if (!videoSetXml) throw new Error("No video track found in DASH manifest");
 
   // Pick video representation
-  const videoReps = [...videoSet.querySelectorAll("Representation")];
-  videoReps.sort((a, b) => (parseInt(b.getAttribute("bandwidth") || "0") - parseInt(a.getAttribute("bandwidth") || "0")));
+  const videoReps = xmlFindAll(videoSetXml, "Representation");
+  videoReps.sort((a, b) => parseInt(xmlAttr(b, "bandwidth") || "0") - parseInt(xmlAttr(a, "bandwidth") || "0"));
 
   let chosenRep = videoReps[0];
   if (selectedQuality && selectedQuality !== "best") {
     const targetH = parseInt(selectedQuality, 10);
-    const match = videoReps.find(r => parseInt(r.getAttribute("height") || "0") === targetH);
+    const match = videoReps.find(r => parseInt(xmlAttr(r, "height") || "0") === targetH);
     if (match) chosenRep = match;
   }
 
-  const repRes = (chosenRep.getAttribute("width") || "?") + "x" + (chosenRep.getAttribute("height") || "?");
+  const repRes = (xmlAttr(chosenRep, "width") || "?") + "x" + (xmlAttr(chosenRep, "height") || "?");
   update("downloading", 3, "Selected " + repRes + " quality...");
 
-  // Get segments from SegmentTemplate or SegmentList or BaseURL
-  const segments = extractDASHSegments(doc, videoSet, chosenRep, mpdUrl);
+  const segments = extractDASHSegments(mpdText, videoSetXml, chosenRep, mpdUrl);
 
-  // Also get audio segments if separate
-  if (audioSet) {
-    const audioReps = [...audioSet.querySelectorAll("Representation")];
-    audioReps.sort((a, b) => parseInt(b.getAttribute("bandwidth") || "0") - parseInt(a.getAttribute("bandwidth") || "0"));
-    const audioSegs = extractDASHSegments(doc, audioSet, audioReps[0], mpdUrl);
-    // Append audio segments after video - content script will combine them all
-    segments.push(...audioSegs);
-    segments._hasAudio = true;
+  if (audioSetXml) {
+    const audioReps = xmlFindAll(audioSetXml, "Representation");
+    audioReps.sort((a, b) => parseInt(xmlAttr(b, "bandwidth") || "0") - parseInt(xmlAttr(a, "bandwidth") || "0"));
+    if (audioReps.length > 0) {
+      const audioSegs = extractDASHSegments(mpdText, audioSetXml, audioReps[0], mpdUrl);
+      segments.push(...audioSegs);
+    }
   }
 
   return segments;
 }
 
-function extractDASHSegments(doc, adaptSet, rep, mpdUrl) {
+function extractDASHSegments(mpdText, adaptSetXml, repXml, mpdUrl) {
   const segments = [];
+  const repId = xmlAttr(repXml, "id") || "1";
+  const bandwidth = xmlAttr(repXml, "bandwidth") || "0";
 
-  // Check for SegmentTemplate
-  const tmpl = rep.querySelector("SegmentTemplate") || adaptSet.querySelector("SegmentTemplate");
-  if (tmpl) {
-    const initTmpl = tmpl.getAttribute("initialization");
-    const mediaTmpl = tmpl.getAttribute("media");
-    const timeline = tmpl.querySelector("SegmentTimeline");
-    const repId = rep.getAttribute("id") || "1";
-    const bandwidth = rep.getAttribute("bandwidth") || "0";
+  // Look for SegmentTemplate in rep first, then adaptationSet
+  const tmplMatch = xmlFindAll(repXml, "SegmentTemplate")[0] || xmlFindAll(adaptSetXml, "SegmentTemplate")[0];
 
-    // Add init segment
+  if (tmplMatch) {
+    const initTmpl = xmlAttr(tmplMatch, "initialization");
+    const mediaTmpl = xmlAttr(tmplMatch, "media");
+
     if (initTmpl) {
       const initUrl = initTmpl.replace(/\$RepresentationID\$/g, repId).replace(/\$Bandwidth\$/g, bandwidth);
       segments.push({ url: resolveUrl(mpdUrl, initUrl), isInit: true });
     }
 
-    if (timeline) {
-      const entries = timeline.querySelectorAll("S");
+    // Check for SegmentTimeline
+    const timelineEntries = xmlFindAll(tmplMatch, "S");
+    if (timelineEntries.length > 0) {
       let time = 0;
-      for (const s of entries) {
-        const t = parseInt(s.getAttribute("t") || String(time), 10);
-        const d = parseInt(s.getAttribute("d") || "0", 10);
-        const r = parseInt(s.getAttribute("r") || "0", 10);
+      for (const s of timelineEntries) {
+        const t = parseInt(xmlAttr(s, "t") || String(time), 10);
+        const d = parseInt(xmlAttr(s, "d") || "0", 10);
+        const r = parseInt(xmlAttr(s, "r") || "0", 10);
         time = t;
         for (let i = 0; i <= r; i++) {
-          const segUrl = mediaTmpl
-            .replace(/\$RepresentationID\$/g, repId)
-            .replace(/\$Bandwidth\$/g, bandwidth)
-            .replace(/\$Time\$/g, String(time))
-            .replace(/\$Number\$/g, String(segments.length));
-          segments.push({ url: resolveUrl(mpdUrl, segUrl) });
+          if (mediaTmpl) {
+            const segUrl = mediaTmpl
+              .replace(/\$RepresentationID\$/g, repId).replace(/\$Bandwidth\$/g, bandwidth)
+              .replace(/\$Time\$/g, String(time)).replace(/\$Number\$/g, String(segments.length));
+            segments.push({ url: resolveUrl(mpdUrl, segUrl) });
+          }
           time += d;
         }
       }
-    } else {
+    } else if (mediaTmpl) {
       // Number-based segments
-      const startNumber = parseInt(tmpl.getAttribute("startNumber") || "1", 10);
-      const duration = parseInt(tmpl.getAttribute("duration") || "0", 10);
-      const timescale = parseInt(tmpl.getAttribute("timescale") || "1", 10);
+      const startNumber = parseInt(xmlAttr(tmplMatch, "startNumber") || "1", 10);
+      const duration = parseInt(xmlAttr(tmplMatch, "duration") || "0", 10);
+      const timescale = parseInt(xmlAttr(tmplMatch, "timescale") || "1", 10);
 
-      // Get total duration from MPD
-      const mpdDuration = doc.querySelector("MPD")?.getAttribute("mediaPresentationDuration");
-      let totalSec = 600; // default 10 min
-      if (mpdDuration) {
-        const m = mpdDuration.match(/PT(?:(\d+)H)?(?:(\d+)M)?(?:([\d.]+)S)?/);
+      const durMatch = mpdText.match(/mediaPresentationDuration="([^"]+)"/);
+      let totalSec = 600;
+      if (durMatch) {
+        const m = durMatch[1].match(/PT(?:(\d+)H)?(?:(\d+)M)?(?:([\d.]+)S)?/);
         if (m) totalSec = (parseInt(m[1] || "0") * 3600) + (parseInt(m[2] || "0") * 60) + parseFloat(m[3] || "0");
       }
 
       if (duration > 0) {
-        const segDurationSec = duration / timescale;
-        const count = Math.ceil(totalSec / segDurationSec);
+        const count = Math.ceil(totalSec / (duration / timescale));
         for (let n = startNumber; n < startNumber + count; n++) {
           const segUrl = mediaTmpl
-            .replace(/\$RepresentationID\$/g, repId)
-            .replace(/\$Bandwidth\$/g, bandwidth)
-            .replace(/\$Number\$/g, String(n))
-            .replace(/\$Number%\d+d\$/g, String(n).padStart(5, "0"));
+            .replace(/\$RepresentationID\$/g, repId).replace(/\$Bandwidth\$/g, bandwidth)
+            .replace(/\$Number\$/g, String(n)).replace(/\$Number%\d+d\$/g, String(n).padStart(5, "0"));
           segments.push({ url: resolveUrl(mpdUrl, segUrl) });
         }
       }
@@ -1236,20 +1256,22 @@ function extractDASHSegments(doc, adaptSet, rep, mpdUrl) {
   }
 
   // Check for SegmentList
-  const segList = rep.querySelector("SegmentList") || adaptSet.querySelector("SegmentList");
-  if (segList) {
-    const initEl = segList.querySelector("Initialization");
-    if (initEl) segments.push({ url: resolveUrl(mpdUrl, initEl.getAttribute("sourceURL")), isInit: true });
-    segList.querySelectorAll("SegmentURL").forEach(su => {
-      segments.push({ url: resolveUrl(mpdUrl, su.getAttribute("media")) });
-    });
+  const segListXml = xmlFindAll(repXml, "SegmentList")[0] || xmlFindAll(adaptSetXml, "SegmentList")[0];
+  if (segListXml) {
+    const initMatch = segListXml.match(/<Initialization[^>]*sourceURL="([^"]*)"[^>]*\/?>/);
+    if (initMatch) segments.push({ url: resolveUrl(mpdUrl, initMatch[1]), isInit: true });
+    const segUrls = xmlFindAll(segListXml, "SegmentURL");
+    for (const su of segUrls) {
+      const media = xmlAttr(su, "media");
+      if (media) segments.push({ url: resolveUrl(mpdUrl, media) });
+    }
     return segments;
   }
 
-  // Check for BaseURL (single file)
-  const baseUrl = rep.querySelector("BaseURL") || adaptSet.querySelector("BaseURL");
-  if (baseUrl) {
-    segments.push({ url: resolveUrl(mpdUrl, baseUrl.textContent.trim()) });
+  // BaseURL
+  const baseContent = xmlInnerContent(repXml, "BaseURL") || xmlInnerContent(adaptSetXml, "BaseURL");
+  if (baseContent) {
+    segments.push({ url: resolveUrl(mpdUrl, baseContent) });
   }
 
   return segments;
@@ -1257,18 +1279,22 @@ function extractDASHSegments(doc, adaptSet, rep, mpdUrl) {
 
 function parseDASHQualities(mpdText) {
   try {
-    const parser = new DOMParser();
-    const doc = parser.parseFromString(mpdText, "text/xml");
     const qualities = [];
-    doc.querySelectorAll("Representation").forEach(r => {
-      const mime = r.getAttribute("mimeType") || r.closest("AdaptationSet")?.getAttribute("mimeType") || "";
-      if (!mime.includes("video")) return;
-      const w = r.getAttribute("width");
-      const h = r.getAttribute("height");
-      const bw = parseInt(r.getAttribute("bandwidth") || "0", 10);
-      const res = (w && h) ? w + "x" + h : null;
-      qualities.push({ resolution: res, bandwidth: bw, uri: "" });
-    });
+    const adaptSets = xmlFindAll(mpdText, "AdaptationSet");
+    for (const asXml of adaptSets) {
+      const asMime = xmlAttr(asXml, "mimeType");
+      const asCt = xmlAttr(asXml, "contentType");
+      const reps = xmlFindAll(asXml, "Representation");
+      for (const r of reps) {
+        const mime = xmlAttr(r, "mimeType") || asMime;
+        if (!mime.includes("video") && asCt !== "video") continue;
+        const w = xmlAttr(r, "width");
+        const h = xmlAttr(r, "height");
+        const bw = parseInt(xmlAttr(r, "bandwidth") || "0", 10);
+        const res = (w && h) ? w + "x" + h : null;
+        qualities.push({ resolution: res, bandwidth: bw, uri: "" });
+      }
+    }
     return qualities.sort((a, b) => b.bandwidth - a.bandwidth);
   } catch (_) { return []; }
 }

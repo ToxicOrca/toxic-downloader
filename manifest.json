@@ -4,7 +4,6 @@
   "version": "1.0.0",
   "description": "Detect and download web video streams — HLS, DASH, and direct files",
   "permissions": [
-    "activeTab",
     "downloads",
     "storage",
     "cookies",
