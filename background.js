@@ -1396,10 +1396,14 @@ const tabUrls = {};
 // --- Auto-scan on page load ---
 chrome.tabs.onUpdated.addListener(async (tabId, changeInfo) => {
   if (changeInfo.status === "loading") {
-    // Always clear video/subtitle store on navigation — downloads use their own state (hlsDownloadTabs, hlsBuffers)
+    // Always clear videoStore on navigation (fixes scan showing stale videos)
     delete videoStore[tabId];
-    delete subtitleStore[tabId];
     chrome.action.setBadgeText({ text: "", tabId });
+    // Only clear subtitleStore if no active download needs it — downloads read subtitles from this store
+    const tabHasActiveDownload = Object.values(hlsDownloadTabs).includes(tabId);
+    if (!tabHasActiveDownload) {
+      delete subtitleStore[tabId];
+    }
   }
 
   // Detect SPA navigation (URL changed without full page reload)
@@ -1408,8 +1412,11 @@ chrome.tabs.onUpdated.addListener(async (tabId, changeInfo) => {
     tabUrls[tabId] = changeInfo.url;
     if (oldUrl && oldUrl !== changeInfo.url) {
       delete videoStore[tabId];
-      delete subtitleStore[tabId];
       chrome.action.setBadgeText({ text: "", tabId });
+      const tabHasActiveDownload = Object.values(hlsDownloadTabs).includes(tabId);
+      if (!tabHasActiveDownload) {
+        delete subtitleStore[tabId];
+      }
       // Clear content script detection state (preserves hlsBuffers for active downloads)
       try { chrome.tabs.sendMessage(tabId, { action: "clearState" }); } catch (_) {}
     }
