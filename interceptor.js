@@ -14,7 +14,7 @@
     window.postMessage({
       type: "TOXIC_SUBTITLE_DETECTED",
       payload: { url },
-    }, "*");
+    }, location.origin);
   }
 
   function checkSubtitleUrl(url) {

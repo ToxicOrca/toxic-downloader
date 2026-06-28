@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Toxic Downloader",
-  "version": "1.0.0",
+  "version": "1.1.1",
   "description": "Detect and download web video streams — HLS, DASH, and direct files",
   "permissions": [
     "downloads",

@@ -9,6 +9,7 @@ import json
 import struct
 import subprocess
 import os
+import re
 import tempfile
 
 def read_message():
@@ -54,17 +55,46 @@ def find_ffmpeg(custom_path=None):
 
     return None
 
-def remux(input_path, output_path, subtitle_path=None, subtitle_lang="eng", ffmpeg_path="ffmpeg"):
-    """Remux TS to MP4 using ffmpeg."""
-    cmd = [ffmpeg_path, "-y", "-i", input_path]
+def remux(input_path, output_path, audio_path=None, subtitle_path=None, subtitle_lang="eng", ffmpeg_path="ffmpeg"):
+    """Remux to MP4 using ffmpeg. Supports separate audio track and subtitle embedding."""
+    cmd = [ffmpeg_path, "-y"]
+    # Extended probing for large/complex containers
+    cmd.extend(["-probesize", "100M", "-analyzeduration", "100M"])
+    cmd.extend(["-i", input_path])
+
+    next_input = 1  # track input index for mapping
+
+    if audio_path and os.path.isfile(audio_path):
+        cmd.extend(["-i", audio_path])
+        audio_input = next_input
+        next_input += 1
+    else:
+        audio_input = None
 
     if subtitle_path and os.path.isfile(subtitle_path):
         cmd.extend(["-i", subtitle_path])
-        cmd.extend(["-map", "0:v", "-map", "0:a?", "-map", "1:0"])
-        cmd.extend(["-c:v", "copy", "-c:a", "copy", "-c:s", "mov_text"])
-        cmd.extend(["-metadata:s:s:0", f"language={subtitle_lang}"])
+        sub_input = next_input
+        next_input += 1
     else:
-        cmd.extend(["-c:v", "copy", "-c:a", "copy"])
+        sub_input = None
+
+    # Map streams explicitly
+    cmd.extend(["-map", "0:v"])
+    if audio_input is not None:
+        # Separate audio file (DASH) — take audio from second input
+        cmd.extend(["-map", f"{audio_input}:a"])
+    else:
+        # Audio is muxed with video — map all audio streams
+        cmd.extend(["-map", "0:a?"])
+
+    if sub_input is not None:
+        cmd.extend(["-map", f"{sub_input}:0"])
+
+    cmd.extend(["-c:v", "copy", "-c:a", "copy"])
+
+    if sub_input is not None:
+        cmd.extend(["-c:s", "mov_text"])
+        cmd.extend(["-metadata:s:s:0", f"language={subtitle_lang}"])
 
     cmd.extend(["-movflags", "+faststart", output_path])
 
@@ -85,8 +115,11 @@ def main():
 
         elif action == "remux":
             input_path = msg.get("inputPath", "")
+            audio_path = msg.get("audioPath", "")
             subtitle_text = msg.get("subtitleText", "")
             subtitle_lang = msg.get("subtitleLang", "eng")
+            if not re.match(r'^[a-zA-Z]{2,3}$', subtitle_lang):
+                subtitle_lang = "eng"
             ffmpeg_path = msg.get("ffmpegPath", "ffmpeg")
 
             ffmpeg = find_ffmpeg(ffmpeg_path)
@@ -113,20 +146,28 @@ def main():
                 with open(sub_path, "w", encoding="utf-8") as f:
                     f.write(subtitle_text)
 
-            try:
-                success, stderr = remux(input_path, output_path, sub_path, subtitle_lang, ffmpeg)
+            # Validate audio path
+            audio_file = audio_path if audio_path and os.path.isfile(audio_path) else None
 
-                # Cleanup temp subtitle
+            try:
+                success, stderr = remux(input_path, output_path, audio_file, sub_path, subtitle_lang, ffmpeg)
+
+                # Cleanup temp files
                 if sub_path and os.path.isfile(sub_path):
                     os.remove(sub_path)
 
                 if success and os.path.isfile(output_path):
                     size = os.path.getsize(output_path)
 
-                    # Remove original TS file
+                    # Remove original input files
                     if input_path != output_path:
                         try:
                             os.remove(input_path)
+                        except:
+                            pass
+                    if audio_file:
+                        try:
+                            os.remove(audio_file)
                         except:
                             pass
 

@@ -421,6 +421,36 @@ function formatSpeed(bytesPerSec) {
   return (bytesPerSec / 1048576).toFixed(1) + " MB/s";
 }
 
+// --- Send segment buffers to content script ---
+
+async function sendBuffersToTab(tabId, dlId, bufs) {
+  const MAX_MSG_BYTES = 40 * 1024 * 1024;
+  for (let s = 0; s < bufs.length; s++) {
+    const buf = bufs[s];
+    const bytes = new Uint8Array(buf);
+    if (bytes.length > MAX_MSG_BYTES) {
+      for (let offset = 0; offset < bytes.length; offset += MAX_MSG_BYTES) {
+        const slice = bytes.subarray(offset, Math.min(offset + MAX_MSG_BYTES, bytes.length));
+        let binary = "";
+        for (let i = 0; i < slice.length; i++) binary += String.fromCharCode(slice[i]);
+        await new Promise((resolve, reject) => {
+          chrome.tabs.sendMessage(tabId, {
+            action: "hlsSegmentData", dlId, chunks: [btoa(binary)],
+          }, (resp) => { chrome.runtime.lastError ? reject(new Error(chrome.runtime.lastError.message)) : resolve(resp); });
+        });
+      }
+    } else {
+      let binary = "";
+      for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
+      await new Promise((resolve, reject) => {
+        chrome.tabs.sendMessage(tabId, {
+          action: "hlsSegmentData", dlId, chunks: [btoa(binary)],
+        }, (resp) => { chrome.runtime.lastError ? reject(new Error(chrome.runtime.lastError.message)) : resolve(resp); });
+      });
+    }
+  }
+}
+
 // --- Verify & Download Direct Files ---
 
 async function verifyAndDownload(url, filename, fallbackExt) {
@@ -863,54 +893,35 @@ async function downloadStream(masterUrl, filename, dlId, cookies, referer, origi
 
     delete downloadSegmentState[dlId];
 
-    // Send to content script for blob save - one segment at a time to stay under 64MB message limit
-    update("downloading", 95, "Combining " + formatBytes(downloadedBytes) + "...");
     const tabIdForSave = hlsDownloadTabs[dlId];
     if (!tabIdForSave) throw new Error("Lost reference to download tab");
 
-    const MAX_MSG_BYTES = 40 * 1024 * 1024; // 40MB limit per message (well under Chrome's 64MB)
+    const remuxEngine = settings.remuxEngine || "builtin";
 
-    for (let s = 0; s < buffers.length; s++) {
-      const buf = buffers[s];
-      const bytes = new Uint8Array(buf);
-
-      // If a single segment exceeds limit, split it into sub-chunks
-      if (bytes.length > MAX_MSG_BYTES) {
-        for (let offset = 0; offset < bytes.length; offset += MAX_MSG_BYTES) {
-          const slice = bytes.subarray(offset, Math.min(offset + MAX_MSG_BYTES, bytes.length));
-          let binary = "";
-          for (let i = 0; i < slice.length; i++) binary += String.fromCharCode(slice[i]);
-          await new Promise((resolve, reject) => {
-            chrome.tabs.sendMessage(tabIdForSave, {
-              action: "hlsSegmentData", dlId, chunks: [btoa(binary)],
-            }, (resp) => { chrome.runtime.lastError ? reject(new Error(chrome.runtime.lastError.message)) : resolve(resp); });
-          });
-        }
-      } else {
-        let binary = "";
-        for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
-        await new Promise((resolve, reject) => {
-          chrome.tabs.sendMessage(tabIdForSave, {
-            action: "hlsSegmentData", dlId, chunks: [btoa(binary)],
-          }, (resp) => { chrome.runtime.lastError ? reject(new Error(chrome.runtime.lastError.message)) : resolve(resp); });
-        });
+    // Separate video and audio buffers for DASH with separate audio track
+    const hasAudioTrack = segments.some(s => s.isAudio);
+    let videoBuffers = buffers;
+    let audioBuffers = [];
+    if (hasAudioTrack) {
+      videoBuffers = [];
+      audioBuffers = [];
+      for (let i = 0; i < buffers.length; i++) {
+        if (segments[i]?.isAudio) audioBuffers.push(buffers[i]);
+        else videoBuffers.push(buffers[i]);
       }
-
-      const pct = Math.round(95 + ((s + 1) / buffers.length) * 3);
-      update("downloading", pct, "Preparing " + (s + 1) + "/" + buffers.length + " (" + formatBytes(downloadedBytes) + ")...");
+      log("[dash] Separated " + videoBuffers.length + " video + " + audioBuffers.length + " audio segments");
     }
 
-    update("downloading", 99, "Saving " + formatBytes(downloadedBytes) + "...");
-
-    // Fetch subtitle data if embed setting is on
+    // Fetch subtitle data if embed setting is on, or native engine (FFmpeg embeds easily)
+    update("downloading", 95, "Processing " + formatBytes(downloadedBytes) + "...");
     let subtitleData = null;
-    if (settings.embedSubtitles && outputFormat === "mp4") {
+    const shouldEmbed = (settings.embedSubtitles || remuxEngine === "native") && outputFormat === "mp4";
+    if (shouldEmbed) {
       const subs = subtitleStore[tabIdForSave];
       if (!subs || subs.length === 0) {
         log("[subs] No subtitles in store for tab " + tabIdForSave);
-        update("downloading", 99, "No subtitles detected on this tab to embed");
       } else {
-        update("downloading", 99, "Fetching subtitle for embed (" + subs[0].url.substring(0, 60) + "...)");
+        update("downloading", 95, "Fetching subtitle for embed...");
 
         // Method 1: Fetch via content script (has page cookies)
         try {
@@ -918,15 +929,9 @@ async function downloadStream(masterUrl, filename, dlId, cookies, referer, origi
             chrome.tabs.sendMessage(tabIdForSave, {
               action: "fetchSubtitle", url: subs[0].url,
             }, (resp) => {
-              if (chrome.runtime.lastError) {
-                update("downloading", 99, "Content script fetch failed: " + chrome.runtime.lastError.message);
-                resolve(null);
-              } else if (!resp?.text) {
-                update("downloading", 99, "Content script returned empty subtitle");
-                resolve(null);
-              } else {
-                resolve(resp.text);
-              }
+              if (chrome.runtime.lastError) resolve(null);
+              else if (!resp?.text) resolve(null);
+              else resolve(resp.text);
             });
           });
           if (subResult) {
@@ -935,15 +940,12 @@ async function downloadStream(masterUrl, filename, dlId, cookies, referer, origi
               subText = convertVttToSrt(subText);
             }
             subtitleData = { text: subText, lang: subs[0].lang || "und" };
-            update("downloading", 99, "Subtitle fetched (" + subText.length + " chars), embedding...");
+            log("[subs] Fetched via content script (" + subText.length + " chars)");
           }
-        } catch (e) {
-          update("downloading", 99, "Content script subtitle error: " + e.message);
-        }
+        } catch (_) {}
 
         // Method 2: Fallback - fetch from background with auth headers
         if (!subtitleData) {
-          update("downloading", 99, "Trying background fetch for subtitle...");
           try {
             const subDomain = new URL(subs[0].url).hostname;
             const tempId = "_sub_" + Date.now();
@@ -959,50 +961,68 @@ async function downloadStream(masterUrl, filename, dlId, cookies, referer, origi
                 subText = convertVttToSrt(subText);
               }
               subtitleData = { text: subText, lang: subs[0].lang || "und" };
-              update("downloading", 99, "Subtitle fetched via background (" + subText.length + " chars), embedding...");
-            } else {
-              update("downloading", 99, "Background subtitle fetch failed: HTTP " + subResp.status);
+              log("[subs] Fetched via background (" + subText.length + " chars)");
             }
-          } catch (e) {
-            update("downloading", 99, "Background subtitle error: " + e.message);
-          }
+          } catch (_) {}
         }
 
         if (!subtitleData) {
-          update("downloading", 99, "Could not fetch subtitle — saving without embed");
+          log("[subs] Could not fetch subtitle — saving without embed");
         }
       }
     }
 
-    const remuxEngine = settings.remuxEngine || "builtin";
-    log("[remux] Engine: " + remuxEngine + " | Format: " + outputFormat + " | Size: " + formatBytes(downloadedBytes) + " | Subs: " + (subtitleData ? subtitleData.text.length + " chars" : "none"));
+    log("[remux] Engine: " + remuxEngine + " | Format: " + outputFormat + " | Size: " + formatBytes(downloadedBytes) + " | Subs: " + (subtitleData ? subtitleData.text.length + " chars" : "none") + " | Audio track: " + hasAudioTrack);
 
     if (remuxEngine === "native") {
-      log("[native] Saving .ts file first...");
-      update("downloading", 99, "Saving as .ts for FFmpeg processing...");
+      // --- Native FFmpeg path ---
+      const fileExt = streamType === "dash" ? ".mp4" : ".ts";
+
+      // Save video segments
+      update("downloading", 96, "Saving video data for FFmpeg...");
+      await sendBuffersToTab(tabIdForSave, dlId, videoBuffers);
       await new Promise((resolve, reject) => {
         chrome.tabs.sendMessage(tabIdForSave, {
-          action: "hlsSave", dlId, filename: filename + ".ts",
-          subtitleData: null,
+          action: "hlsSaveRaw", dlId, filename: filename + fileExt,
         }, (resp) => { chrome.runtime.lastError ? reject(new Error(chrome.runtime.lastError.message)) : resolve(resp); });
       });
 
-      update("downloading", 99, "Waiting for file save...");
+      // Save audio segments separately if DASH with separate audio
+      if (audioBuffers.length > 0) {
+        update("downloading", 97, "Saving audio data for FFmpeg...");
+        await sendBuffersToTab(tabIdForSave, dlId, audioBuffers);
+        await new Promise((resolve, reject) => {
+          chrome.tabs.sendMessage(tabIdForSave, {
+            action: "hlsSaveRaw", dlId, filename: filename + "_audio" + fileExt,
+          }, (resp) => { chrome.runtime.lastError ? reject(new Error(chrome.runtime.lastError.message)) : resolve(resp); });
+        });
+      }
+
+      update("downloading", 98, "Waiting for file save...");
       await new Promise(r => setTimeout(r, 3000));
 
-      const downloads = await new Promise(r => chrome.downloads.search({ orderBy: ["-startTime"], limit: 10 }, r));
+      // Find saved files
+      const downloads = await new Promise(r => chrome.downloads.search({ orderBy: ["-startTime"], limit: 20 }, r));
       log("[native] Recent downloads: " + (downloads || []).map(d => d.filename?.split(/[/\\]/).pop() + " (" + d.state + ")").join(", "));
-      const tsDownload = downloads?.find(d => d.filename && d.state === "complete" && (d.filename.includes(filename) || d.filename.endsWith(".ts")));
 
-      if (tsDownload?.filename) {
-        log("[native] Found file: " + tsDownload.filename);
+      const videoDownload = downloads?.find(d => d.filename && d.state === "complete" && d.filename.includes(filename) && !d.filename.includes("_audio"));
+      let audioPath = "";
+      if (audioBuffers.length > 0) {
+        const audioDownload = downloads?.find(d => d.filename && d.state === "complete" && d.filename.includes(filename + "_audio"));
+        if (audioDownload?.filename) audioPath = audioDownload.filename;
+        else log("[native] Warning: could not find audio file");
+      }
+
+      if (videoDownload?.filename) {
+        log("[native] Video: " + videoDownload.filename + (audioPath ? " | Audio: " + audioPath : ""));
         update("downloading", 99, "Remuxing with FFmpeg...");
         try {
           const nativeResult = await new Promise((resolve, reject) => {
             try {
               chrome.runtime.sendNativeMessage("com.toxicdownloader.ffmpeg", {
                 action: "remux",
-                inputPath: tsDownload.filename,
+                inputPath: videoDownload.filename,
+                audioPath: audioPath,
                 subtitleText: subtitleData?.text || "",
                 subtitleLang: subtitleData?.lang || "eng",
                 ffmpegPath: settings.ffmpegPath || "ffmpeg",
@@ -1025,20 +1045,24 @@ async function downloadStream(masterUrl, filename, dlId, cookies, referer, origi
             update("done", 100, "Remuxed with FFmpeg! " + formatBytes(nativeResult.size || downloadedBytes));
             sendNotification("Download Complete", filename + ".mp4 (remuxed with FFmpeg)");
           } else {
-            update("done", 100, "FFmpeg failed: " + (nativeResult?.error || "unknown") + " — .ts file saved");
+            update("done", 100, "FFmpeg failed: " + (nativeResult?.error || "unknown") + " — raw file saved");
             log("[native] FAILED: " + (nativeResult?.error || "no response"));
-            sendNotification("Download Saved", filename + ".ts (FFmpeg remux failed)");
+            sendNotification("Download Saved", filename + fileExt + " (FFmpeg remux failed)");
           }
         } catch (e) {
           log("[native] Exception: " + e.message);
-          update("done", 100, "Native host error: " + e.message + " — .ts file saved");
+          update("done", 100, "Native host error: " + e.message + " — raw file saved");
         }
       } else {
-        log("[native] Could not find downloaded .ts file");
-        update("done", 100, "Could not locate saved file for FFmpeg processing — .ts file saved");
+        log("[native] Could not find downloaded video file");
+        update("done", 100, "Could not locate saved file for FFmpeg processing — raw file saved");
       }
     } else {
-      // Built-in remux (default) — send to content script
+      // --- Built-in remux (default) — send to content script ---
+      update("downloading", 96, "Combining " + formatBytes(downloadedBytes) + "...");
+      await sendBuffersToTab(tabIdForSave, dlId, buffers);
+
+      update("downloading", 99, "Saving...");
       log("[builtin] Sending to content script for save/remux. File: " + filename + "." + outputFormat);
       await new Promise((resolve, reject) => {
         chrome.tabs.sendMessage(tabIdForSave, {
@@ -1186,7 +1210,7 @@ async function resolveDASHSegments(mpdText, mpdUrl, selectedQuality, update) {
     audioReps.sort((a, b) => parseInt(xmlAttr(b, "bandwidth") || "0") - parseInt(xmlAttr(a, "bandwidth") || "0"));
     if (audioReps.length > 0) {
       const audioSegs = extractDASHSegments(mpdText, audioSetXml, audioReps[0], mpdUrl);
-      segments.push(...audioSegs);
+      segments.push(...audioSegs.map(s => ({ ...s, isAudio: true })));
     }
   }
 
@@ -1372,12 +1396,10 @@ const tabUrls = {};
 // --- Auto-scan on page load ---
 chrome.tabs.onUpdated.addListener(async (tabId, changeInfo) => {
   if (changeInfo.status === "loading") {
-    const tabHasActiveDownload = Object.values(hlsDownloadTabs).includes(tabId);
-    if (!tabHasActiveDownload) {
-      delete videoStore[tabId];
-      delete subtitleStore[tabId];
-      chrome.action.setBadgeText({ text: "", tabId });
-    }
+    // Always clear video/subtitle store on navigation — downloads use their own state (hlsDownloadTabs, hlsBuffers)
+    delete videoStore[tabId];
+    delete subtitleStore[tabId];
+    chrome.action.setBadgeText({ text: "", tabId });
   }
 
   // Detect SPA navigation (URL changed without full page reload)
@@ -1385,14 +1407,11 @@ chrome.tabs.onUpdated.addListener(async (tabId, changeInfo) => {
     const oldUrl = tabUrls[tabId];
     tabUrls[tabId] = changeInfo.url;
     if (oldUrl && oldUrl !== changeInfo.url) {
-      // Don't clear if this tab has an active download
-      const tabHasActiveDownload = Object.values(hlsDownloadTabs).includes(tabId);
-      if (!tabHasActiveDownload) {
-        delete videoStore[tabId];
-        delete subtitleStore[tabId];
-        chrome.action.setBadgeText({ text: "", tabId });
-        try { chrome.tabs.sendMessage(tabId, { action: "clearState" }); } catch (_) {}
-      }
+      delete videoStore[tabId];
+      delete subtitleStore[tabId];
+      chrome.action.setBadgeText({ text: "", tabId });
+      // Clear content script detection state (preserves hlsBuffers for active downloads)
+      try { chrome.tabs.sendMessage(tabId, { action: "clearState" }); } catch (_) {}
     }
   }
   if (changeInfo.status === "complete") {

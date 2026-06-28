@@ -405,6 +405,8 @@
     if (/doubleclick|googlesyndication|advertisement|adserver|ad[_\-]?break|preroll|midroll/i.test(lower)) return "ad";
     if (/\/seg-\d+|\/segment\d+/i.test(lower) && !/master|index|playlist/i.test(lower)) return "segment";
     if (/\.ts$/i.test(lower) && !/master|index|playlist/i.test(lower)) return "segment";
+    // YouTube URLs use signed tokens and separate audio/video — not directly downloadable
+    if (/googlevideo\.com|youtube\.com\/videoplayback/i.test(lower)) return "unsupported";
     return "content";
   }
 
@@ -438,7 +440,7 @@
     if (seenUrls.has(normalized)) return;
 
     const classification = classifyVideo(url);
-    if (classification === "ad" || classification === "segment") return;
+    if (classification === "ad" || classification === "segment" || classification === "unsupported") return;
 
     seenUrls.add(normalized);
 
