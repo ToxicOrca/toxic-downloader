@@ -451,6 +451,74 @@ async function sendBuffersToTab(tabId, dlId, bufs) {
   }
 }
 
+// --- Wait for a Chrome download to complete, returns the download item ---
+
+function waitForDownload(filenameFragment, timeoutMs = 30000) {
+  return new Promise((resolve) => {
+    let downloadId = null;
+    let settled = false;
+
+    function cleanup() {
+      chrome.downloads.onChanged.removeListener(onChange);
+    }
+
+    const timeout = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      // Last-ditch search
+      chrome.downloads.search({ orderBy: ["-startTime"], limit: 10 }, (items) => {
+        const match = items?.find(d => d.filename && d.state === "complete" && d.filename.includes(filenameFragment));
+        resolve(match || null);
+      });
+    }, timeoutMs);
+
+    function onChange(delta) {
+      if (settled) return;
+      // If we don't have the download ID yet, check if this delta has a filename match
+      if (!downloadId && delta.filename?.current?.includes(filenameFragment)) {
+        downloadId = delta.id;
+      }
+      if (delta.id !== downloadId) return;
+      if (delta.state?.current === "complete") {
+        settled = true;
+        clearTimeout(timeout);
+        cleanup();
+        chrome.downloads.search({ id: downloadId }, (items) => resolve(items?.[0] || null));
+      } else if (delta.state?.current === "interrupted") {
+        settled = true;
+        clearTimeout(timeout);
+        cleanup();
+        resolve(null);
+      }
+    }
+
+    chrome.downloads.onChanged.addListener(onChange);
+
+    // Poll to find the download (handles race where download started before listener)
+    const pollInterval = setInterval(() => {
+      if (settled) { clearInterval(pollInterval); return; }
+      chrome.downloads.search({ orderBy: ["-startTime"], limit: 10 }, (items) => {
+        if (settled) return;
+        for (const d of (items || [])) {
+          if (!d.filename?.includes(filenameFragment)) continue;
+          if (d.state === "complete") {
+            settled = true;
+            clearInterval(pollInterval);
+            clearTimeout(timeout);
+            cleanup();
+            resolve(d);
+            return;
+          }
+          if (d.state === "in_progress" && !downloadId) {
+            downloadId = d.id;
+          }
+        }
+      });
+    }, 1000);
+  });
+}
+
 // --- Verify & Download Direct Files ---
 
 async function verifyAndDownload(url, filename, fallbackExt) {
@@ -977,44 +1045,47 @@ async function downloadStream(masterUrl, filename, dlId, cookies, referer, origi
     if (remuxEngine === "native") {
       // --- Native FFmpeg path ---
       const fileExt = streamType === "dash" ? ".mp4" : ".ts";
+      const videoFilename = filename + fileExt;
+      const audioFilename = audioBuffers.length > 0 ? filename + "_audio" + fileExt : null;
+
+      // Start listening for downloads BEFORE triggering saves
+      const videoWait = waitForDownload(filename + fileExt);
 
       // Save video segments
       update("downloading", 96, "Saving video data for FFmpeg...");
       await sendBuffersToTab(tabIdForSave, dlId, videoBuffers);
       await new Promise((resolve, reject) => {
         chrome.tabs.sendMessage(tabIdForSave, {
-          action: "hlsSaveRaw", dlId, filename: filename + fileExt,
+          action: "hlsSaveRaw", dlId, filename: videoFilename,
         }, (resp) => { chrome.runtime.lastError ? reject(new Error(chrome.runtime.lastError.message)) : resolve(resp); });
       });
 
       // Save audio segments separately if DASH with separate audio
-      if (audioBuffers.length > 0) {
+      let audioWait = null;
+      if (audioFilename) {
+        audioWait = waitForDownload(audioFilename);
         update("downloading", 97, "Saving audio data for FFmpeg...");
         await sendBuffersToTab(tabIdForSave, dlId, audioBuffers);
         await new Promise((resolve, reject) => {
           chrome.tabs.sendMessage(tabIdForSave, {
-            action: "hlsSaveRaw", dlId, filename: filename + "_audio" + fileExt,
+            action: "hlsSaveRaw", dlId, filename: audioFilename,
           }, (resp) => { chrome.runtime.lastError ? reject(new Error(chrome.runtime.lastError.message)) : resolve(resp); });
         });
       }
 
+      // Wait for file saves to complete (with timeout)
       update("downloading", 98, "Waiting for file save...");
-      await new Promise(r => setTimeout(r, 3000));
-
-      // Find saved files
-      const downloads = await new Promise(r => chrome.downloads.search({ orderBy: ["-startTime"], limit: 20 }, r));
-      log("[native] Recent downloads: " + (downloads || []).map(d => d.filename?.split(/[/\\]/).pop() + " (" + d.state + ")").join(", "));
-
-      const videoDownload = downloads?.find(d => d.filename && d.state === "complete" && d.filename.includes(filename) && !d.filename.includes("_audio"));
+      const videoDownload = await videoWait;
       let audioPath = "";
-      if (audioBuffers.length > 0) {
-        const audioDownload = downloads?.find(d => d.filename && d.state === "complete" && d.filename.includes(filename + "_audio"));
+      if (audioWait) {
+        const audioDownload = await audioWait;
         if (audioDownload?.filename) audioPath = audioDownload.filename;
         else log("[native] Warning: could not find audio file");
       }
 
+      log("[native] Video: " + (videoDownload?.filename || "NOT FOUND") + (audioPath ? " | Audio: " + audioPath : ""));
+
       if (videoDownload?.filename) {
-        log("[native] Video: " + videoDownload.filename + (audioPath ? " | Audio: " + audioPath : ""));
         update("downloading", 99, "Remuxing with FFmpeg...");
         try {
           const nativeResult = await new Promise((resolve, reject) => {
