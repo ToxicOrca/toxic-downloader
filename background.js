@@ -89,7 +89,7 @@ chrome.contextMenus.onClicked.addListener((info, tab) => {
     chrome.downloads.download({ url: info.srcUrl, filename: "video_" + Date.now() + "." + ext, saveAs: true });
   }
   if (info.menuItemId === "toxic-scan-page" && tab?.id) {
-    chrome.tabs.sendMessage(tab.id, { action: "scan" });
+    chrome.tabs.sendMessage(tab.id, { action: "scan" }).catch(() => {});
   }
 });
 
@@ -313,7 +313,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     // Tell content script to clear its buffers for this download
     const cancelTabId = hlsDownloadTabs[msg.dlId];
     if (cancelTabId) {
-      try { chrome.tabs.sendMessage(cancelTabId, { action: "hlsClearBuffers", dlId: msg.dlId }); } catch (_) {}
+      chrome.tabs.sendMessage(cancelTabId, { action: "hlsClearBuffers", dlId: msg.dlId }).catch(() => {});
     }
     cleanupDownload(msg.dlId);
     sendResponse({ ok: true });
@@ -1418,7 +1418,7 @@ chrome.tabs.onUpdated.addListener(async (tabId, changeInfo) => {
         delete subtitleStore[tabId];
       }
       // Clear content script detection state (preserves hlsBuffers for active downloads)
-      try { chrome.tabs.sendMessage(tabId, { action: "clearState" }); } catch (_) {}
+      chrome.tabs.sendMessage(tabId, { action: "clearState" }).catch(() => {});
     }
   }
   if (changeInfo.status === "complete") {
@@ -1430,7 +1430,7 @@ chrome.tabs.onUpdated.addListener(async (tabId, changeInfo) => {
 
       const settings = await getSettings();
       if (settings.autoScan) {
-        try { chrome.tabs.sendMessage(tabId, { action: "scan" }); } catch (_) {}
+        chrome.tabs.sendMessage(tabId, { action: "scan" }).catch(() => {});
       }
     });
   }
