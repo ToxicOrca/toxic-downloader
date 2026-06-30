@@ -451,6 +451,34 @@ async function sendBuffersToTab(tabId, dlId, bufs) {
   }
 }
 
+// --- Base64 encode ArrayBuffer efficiently ---
+
+function arrayBufferToBase64(buffer) {
+  return new Promise((resolve) => {
+    const blob = new Blob([buffer]);
+    const reader = new FileReader();
+    reader.onload = () => resolve(reader.result.split(",")[1] || "");
+    reader.readAsDataURL(blob);
+  });
+}
+
+// --- Native messaging helpers ---
+
+function openNativePort() {
+  const port = chrome.runtime.connectNative("com.toxicdownloader.ffmpeg");
+  const pending = [];
+  port.onMessage.addListener((resp) => {
+    if (pending.length > 0) pending.shift()(resp);
+  });
+  port.onDisconnect.addListener(() => {
+    while (pending.length > 0) pending.shift()({ success: false, error: "Native host disconnected" });
+  });
+  return {
+    send(msg) { return new Promise((resolve) => { pending.push(resolve); port.postMessage(msg); }); },
+    disconnect() { port.disconnect(); },
+  };
+}
+
 // --- Wait for a Chrome download to complete, returns the download item ---
 
 function waitForDownload(filenameFragment, timeoutMs = 30000) {
@@ -1043,91 +1071,72 @@ async function downloadStream(masterUrl, filename, dlId, cookies, referer, origi
     log("[remux] Engine: " + remuxEngine + " | Format: " + outputFormat + " | Size: " + formatBytes(downloadedBytes) + " | Subs: " + (subtitleData ? subtitleData.text.length + " chars" : "none") + " | Audio track: " + hasAudioTrack);
 
     if (remuxEngine === "native") {
-      // --- Native FFmpeg path ---
+      // --- Native FFmpeg path: stream data directly to native host ---
       const fileExt = streamType === "dash" ? ".mp4" : ".ts";
-      const videoFilename = filename + fileExt;
-      const audioFilename = audioBuffers.length > 0 ? filename + "_audio" + fileExt : null;
+      const native = openNativePort();
 
-      // Start listening for downloads BEFORE triggering saves
-      const videoWait = waitForDownload(filename + fileExt);
+      // Determine downloads folder from a recent download
+      const recentDls = await new Promise(r => chrome.downloads.search({ limit: 1, orderBy: ["-startTime"] }, r));
+      const dlDir = recentDls?.[0]?.filename?.replace(/[/\\][^/\\]+$/, "");
+      if (!dlDir) throw new Error("Could not determine downloads folder — download something first");
+      const sep = dlDir.includes("\\") ? "\\" : "/";
 
-      // Save video segments
-      update("downloading", 96, "Saving video data for FFmpeg...");
-      await sendBuffersToTab(tabIdForSave, dlId, videoBuffers);
-      await new Promise((resolve, reject) => {
-        chrome.tabs.sendMessage(tabIdForSave, {
-          action: "hlsSaveRaw", dlId, filename: videoFilename,
-        }, (resp) => { chrome.runtime.lastError ? reject(new Error(chrome.runtime.lastError.message)) : resolve(resp); });
-      });
+      // Write video file directly via native host
+      const videoPath = dlDir + sep + filename + fileExt;
+      log("[native] Writing video to: " + videoPath);
+      let writeResult = await native.send({ action: "writeStart", path: videoPath });
+      if (!writeResult.success) throw new Error("Failed to open video file: " + writeResult.error);
 
-      // Save audio segments separately if DASH with separate audio
-      let audioWait = null;
-      if (audioFilename) {
-        audioWait = waitForDownload(audioFilename);
-        update("downloading", 97, "Saving audio data for FFmpeg...");
-        await sendBuffersToTab(tabIdForSave, dlId, audioBuffers);
-        await new Promise((resolve, reject) => {
-          chrome.tabs.sendMessage(tabIdForSave, {
-            action: "hlsSaveRaw", dlId, filename: audioFilename,
-          }, (resp) => { chrome.runtime.lastError ? reject(new Error(chrome.runtime.lastError.message)) : resolve(resp); });
-        });
+      for (let s = 0; s < videoBuffers.length; s++) {
+        const b64 = await arrayBufferToBase64(videoBuffers[s]);
+        writeResult = await native.send({ action: "writeChunk", path: videoPath, data: b64 });
+        if (!writeResult.success) throw new Error("Failed to write video chunk: " + writeResult.error);
+        const pct = Math.round(96 + (s / videoBuffers.length) * 2);
+        update("downloading", pct, "Writing video " + (s + 1) + "/" + videoBuffers.length + " (" + formatBytes(downloadedBytes) + ")...");
       }
+      await native.send({ action: "writeEnd", path: videoPath });
 
-      // Wait for file saves to complete (with timeout)
-      update("downloading", 98, "Waiting for file save...");
-      const videoDownload = await videoWait;
+      // Write audio file if DASH with separate audio
       let audioPath = "";
-      if (audioWait) {
-        const audioDownload = await audioWait;
-        if (audioDownload?.filename) audioPath = audioDownload.filename;
-        else log("[native] Warning: could not find audio file");
-      }
-
-      log("[native] Video: " + (videoDownload?.filename || "NOT FOUND") + (audioPath ? " | Audio: " + audioPath : ""));
-
-      if (videoDownload?.filename) {
-        update("downloading", 99, "Remuxing with FFmpeg...");
-        try {
-          const nativeResult = await new Promise((resolve, reject) => {
-            try {
-              chrome.runtime.sendNativeMessage("com.toxicdownloader.ffmpeg", {
-                action: "remux",
-                inputPath: videoDownload.filename,
-                audioPath: audioPath,
-                subtitleText: subtitleData?.text || "",
-                subtitleLang: subtitleData?.lang || "eng",
-                ffmpegPath: settings.ffmpegPath || "ffmpeg",
-              }, (resp) => {
-                if (chrome.runtime.lastError) {
-                  log("[native] sendNativeMessage error: " + chrome.runtime.lastError.message);
-                  resolve({ success: false, error: chrome.runtime.lastError.message });
-                } else {
-                  resolve(resp);
-                }
-              });
-            } catch (e) {
-              log("[native] sendNativeMessage exception: " + e.message);
-              resolve({ success: false, error: e.message });
-            }
-          });
-
-          log("[native] Result: " + JSON.stringify(nativeResult));
-          if (nativeResult?.success) {
-            update("done", 100, "Remuxed with FFmpeg! " + formatBytes(nativeResult.size || downloadedBytes));
-            sendNotification("Download Complete", filename + ".mp4 (remuxed with FFmpeg)");
-          } else {
-            update("done", 100, "FFmpeg failed: " + (nativeResult?.error || "unknown") + " — raw file saved");
-            log("[native] FAILED: " + (nativeResult?.error || "no response"));
-            sendNotification("Download Saved", filename + fileExt + " (FFmpeg remux failed)");
-          }
-        } catch (e) {
-          log("[native] Exception: " + e.message);
-          update("done", 100, "Native host error: " + e.message + " — raw file saved");
+      if (audioBuffers.length > 0) {
+        audioPath = dlDir + sep + filename + "_audio" + fileExt;
+        log("[native] Writing audio to: " + audioPath);
+        await native.send({ action: "writeStart", path: audioPath });
+        for (let s = 0; s < audioBuffers.length; s++) {
+          const b64 = await arrayBufferToBase64(audioBuffers[s]);
+          await native.send({ action: "writeChunk", path: audioPath, data: b64 });
         }
-      } else {
-        log("[native] Could not find downloaded video file");
-        update("done", 100, "Could not locate saved file for FFmpeg processing — raw file saved");
+        await native.send({ action: "writeEnd", path: audioPath });
       }
+
+      // Remux with FFmpeg via the same native connection
+      update("downloading", 99, "Remuxing with FFmpeg...");
+      log("[native] Video: " + videoPath + (audioPath ? " | Audio: " + audioPath : ""));
+      try {
+        const nativeResult = await native.send({
+          action: "remux",
+          inputPath: videoPath,
+          audioPath: audioPath,
+          subtitleText: subtitleData?.text || "",
+          subtitleLang: subtitleData?.lang || "eng",
+          ffmpegPath: settings.ffmpegPath || "ffmpeg",
+        });
+
+        log("[native] Result: " + JSON.stringify(nativeResult));
+        if (nativeResult?.success) {
+          update("done", 100, "Remuxed with FFmpeg! " + formatBytes(nativeResult.size || downloadedBytes));
+          sendNotification("Download Complete", filename + ".mp4 (remuxed with FFmpeg)");
+        } else {
+          update("done", 100, "FFmpeg failed: " + (nativeResult?.error || "unknown") + " — raw file saved");
+          log("[native] FAILED: " + (nativeResult?.error || "no response"));
+          sendNotification("Download Saved", filename + fileExt + " (FFmpeg remux failed)");
+        }
+      } catch (e) {
+        log("[native] Exception: " + e.message);
+        update("done", 100, "Native host error: " + e.message + " — raw file saved");
+      }
+
+      native.disconnect();
     } else {
       // --- Built-in remux (default) — send to content script ---
       update("downloading", 96, "Combining " + formatBytes(downloadedBytes) + "...");

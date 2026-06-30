@@ -10,6 +10,7 @@ import struct
 import subprocess
 import os
 import re
+import base64
 import tempfile
 
 def read_message():
@@ -102,6 +103,8 @@ def remux(input_path, output_path, audio_path=None, subtitle_path=None, subtitle
     return result.returncode == 0, result.stderr.decode("utf-8", errors="replace")[-500:]
 
 def main():
+    open_files = {}  # path -> file handle
+
     while True:
         msg = read_message()
         if msg is None:
@@ -109,7 +112,37 @@ def main():
 
         action = msg.get("action")
 
-        if action == "ping":
+        if action == "writeStart":
+            path = msg.get("path", "")
+            try:
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                open_files[path] = open(path, "wb")
+                send_message({"success": True})
+            except Exception as e:
+                send_message({"success": False, "error": str(e)})
+
+        elif action == "writeChunk":
+            path = msg.get("path", "")
+            f = open_files.get(path)
+            if not f:
+                send_message({"success": False, "error": "File not open: " + path})
+                continue
+            try:
+                data = base64.b64decode(msg.get("data", ""))
+                f.write(data)
+                send_message({"success": True, "wrote": len(data)})
+            except Exception as e:
+                send_message({"success": False, "error": str(e)})
+
+        elif action == "writeEnd":
+            path = msg.get("path", "")
+            f = open_files.pop(path, None)
+            if f:
+                f.close()
+            size = os.path.getsize(path) if os.path.isfile(path) else 0
+            send_message({"success": True, "path": path, "size": size})
+
+        elif action == "ping":
             ffmpeg = find_ffmpeg(msg.get("ffmpegPath"))
             send_message({"success": True, "ffmpegFound": ffmpeg is not None, "path": ffmpeg or ""})
 
